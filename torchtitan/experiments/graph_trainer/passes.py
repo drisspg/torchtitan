@@ -337,6 +337,21 @@ def compile_time_passes(
     if config.parallelism.enable_async_tensor_parallel:
         passes.append(async_tensor_parallel_pass)
 
+    if config.compile.enable_flex_gemm_swiglu:
+        # Model-shape-aware rewrite: it must see the post-remat graph and must
+        # run before the terminal Inductor pass that lowers the FlexGEMM HOP.
+        if config.compile.inductor_compilation != "full":
+            raise ValueError(
+                "--compile.enable_flex_gemm_swiglu requires "
+                "--compile.inductor_compilation full; otherwise the inserted "
+                "flex_gemm HOP is interpreted instead of lowered to QUACK."
+            )
+        from torchtitan.experiments.graph_trainer.flex_gemm_passes import (
+            flex_gemm_swiglu_pass,
+        )
+
+        passes.append(flex_gemm_swiglu_pass)
+
     if not include_inductor:
         return passes
 

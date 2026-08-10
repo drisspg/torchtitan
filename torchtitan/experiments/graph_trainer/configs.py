@@ -125,6 +125,15 @@ class GraphTrainerCompileConfig(CompileConfig):
     """Enable passes that improve performance but may change numerics
     compared to the uncompiled path (e.g. RMSNorm Inductor fusion)."""
 
+    enable_flex_gemm_swiglu: bool = False
+    """Fuse dense SwiGLU forward sites into ``flex_gemm`` (QUACK backend).
+
+    Requires a PyTorch build with the FlexGEMM HOP plus its CuTeDSL/QuACK
+    dependencies, an SM100+ GPU, and ``--compile.inductor_compilation full`` so
+    the terminal Inductor pass lowers the HOP. The fused epilogue is evaluated
+    on the Float32 GEMM accumulator instead of the rounded BFloat16 gate value,
+    so losses are close to but not bitwise equal to the unfused graph."""
+
     cpu_offload_prefetch_n_layers: int = 1
     """Prefetch reloads this many layers ahead in the backward graph
     to overlap H2D transfers with compute."""
