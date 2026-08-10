@@ -136,6 +136,8 @@ def test_cuda_fullgraph_quack_forward_and_all_gradients_match_reference():
 
     code = "\n".join(generated_code)
     assert "gemm_epimod as flex_gemm_runtime" in code
+    assert "fast_math: True" in code
+    assert "fastmath=True" in code
     assert "epilogue_arg_kinds=('tile',)" in code
     assert "aux_outs=" in code
 

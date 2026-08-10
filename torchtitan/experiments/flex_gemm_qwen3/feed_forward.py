@@ -6,9 +6,9 @@
 
 """Explicit first-order autograd for a QUACK FlexGEMM Qwen3 SwiGLU block.
 
-The forward fuses the gate projection, FP32 SiLU, and multiplication by the
-captured up projection. FlexGEMM has no autograd formula, so the custom Function
-owns the activation gradient and all three weight gradients.
+The forward fuses the gate projection, fast-math FP32 SiLU, and multiplication
+by the captured up projection. FlexGEMM has no autograd formula, so the custom
+Function owns the activation gradient and all three weight gradients.
 """
 
 from dataclasses import dataclass
@@ -41,7 +41,11 @@ class FlexGEMMSwiGLUFunction(torch.autograd.Function):
             torch.mm,
             (x_MD, w1_HD.t()),
             epilogue,
-            kernel_options={"backend": "QUACK", "tuned": tuned},
+            kernel_options={
+                "backend": "QUACK",
+                "tuned": tuned,
+                "fast_math": True,
+            },
         )
         ctx.save_for_backward(x_MD, w1_HD, w2_DH, w3_HD, gate_MH, up_MH)
         return torch.mm(gated_MH, w2_DH.t())
