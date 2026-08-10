@@ -24,12 +24,12 @@ saved gate value (``silu_backward``) and the saved up value. Returning the gate
 as an auxiliary is what keeps the rewrite work-neutral: without it the standalone
 gate GEMM would have to stay live for the backward, leaving two gate GEMMs.
 
-Numerics: FlexGEMM evaluates the epilogue on the Float32 GEMM accumulator, while
-the matched graph applies ``silu``/``mul`` to the rounded BFloat16 gate value. The
-fused main output is therefore closer to a high-precision reference than the
-graph it replaces, but not bitwise equal to it. The auxiliary gate output keeps
-the original ``[M, N]`` rounding, so the traced backward reads the same kind of
-value it read before. The pass is opt-in for that reason.
+Numerics: FlexGEMM evaluates the epilogue on the Float32 GEMM accumulator and
+uses its fast-math tanh identity for SiLU, while the matched graph applies the
+standard ``silu``/``mul`` to the rounded BFloat16 gate value. The fused output is
+therefore not bitwise equal to the graph it replaces. The auxiliary gate output
+keeps the original ``[M, N]`` rounding, so the traced backward still reads the
+same kind of value it read before. The pass is opt-in for that reason.
 
 NOTE [FlexGEMM kernels and compile-time autotuning]
 ``standalone_compile``, which backs both regional and full Inductor compilation,
@@ -61,6 +61,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from torchtitan.tools.logging import logger
 
 QUACK_KERNEL_OPTIONS = {"backend": "QUACK", "tuned": True}
+QUACK_SWIGLU_KERNEL_OPTIONS = {**QUACK_KERNEL_OPTIONS, "fast_math": True}
 
 _CUTEDSL_KERNEL_PREFIX = "cutedsl_"
 
@@ -377,7 +378,7 @@ def _fuse_site(gm: torch.fx.GraphModule, site: SwiGluSite, body_name: str) -> No
                 body_attr,
                 (a_node, b_node, site.up),
                 {},
-                dict(QUACK_KERNEL_OPTIONS),
+                dict(QUACK_SWIGLU_KERNEL_OPTIONS),
             ),
         )
         main = graph.call_function(operator.getitem, (fused, 0))
@@ -516,6 +517,6 @@ def flex_gemm_swiglu_pass(
     gm.recompile()
     logger.info(
         f"flex_gemm_swiglu_pass: fused {len(sites)} dense SwiGLU sites into "
-        f"flex_gemm with kernel_options={QUACK_KERNEL_OPTIONS}"
+        f"flex_gemm with kernel_options={QUACK_SWIGLU_KERNEL_OPTIONS}"
     )
     return gm

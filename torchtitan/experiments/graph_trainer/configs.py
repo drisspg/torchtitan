@@ -130,9 +130,10 @@ class GraphTrainerCompileConfig(CompileConfig):
 
     Requires a PyTorch build with the FlexGEMM HOP plus its CuTeDSL/QuACK
     dependencies, an SM100+ GPU, and ``--compile.inductor_compilation full`` so
-    the terminal Inductor pass lowers the HOP. The fused epilogue is evaluated
-    on the Float32 GEMM accumulator instead of the rounded BFloat16 gate value,
-    so losses are close to but not bitwise equal to the unfused graph."""
+    the terminal Inductor pass lowers the HOP. The fused epilogue uses the
+    fast-math tanh SiLU identity on the Float32 GEMM accumulator instead of the
+    standard SiLU on the rounded BFloat16 gate value, so losses are close to but
+    not bitwise equal to the unfused graph."""
 
     enable_flex_gemm_residual: bool = False
     """Fuse Qwen3 attention and FFN output GEMMs with their residual adds.

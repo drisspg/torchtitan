@@ -27,6 +27,7 @@ from torchtitan.experiments.graph_trainer.flex_gemm_passes import (
     flex_gemm_residual_pass,
     flex_gemm_swiglu_pass,
     QUACK_KERNEL_OPTIONS,
+    QUACK_SWIGLU_KERNEL_OPTIONS,
 )
 from torchtitan.experiments.graph_trainer.inductor_passes import (
     full_inductor_compilation_pass,
@@ -139,7 +140,7 @@ class TestFlexGemmSwiGluPass(TestCase):
         self.assertEqual(body_attr.op, "get_attr")
         self.assertEqual(len(gemm_args), 3)
         self.assertEqual(gemm_kwargs, {})
-        self.assertEqual(kernel_options, QUACK_KERNEL_OPTIONS)
+        self.assertEqual(kernel_options, QUACK_SWIGLU_KERNEL_OPTIONS)
 
         # The forward silu/mul are gone and the forward gate GEMM was absorbed;
         # the backward recompute GEMM stays.
@@ -411,6 +412,9 @@ class TestFlexGemmSwiGluCompiled(TestCase):
         code = "\n".join(sources)
         self.assertIn("flex_gemm_runtime(", code)
         self.assertIn("tuned=True", code)
+        self.assertIn("fast_math: True", code)
+        self.assertIn("cute.math.tanh(", code)
+        self.assertIn("fastmath=True", code)
         self.assertIn("epilogue_arg_kinds=('tile',)", code)
         self.assertIn("aux_outs=", code)
         # The fused site no longer runs a separate gate GEMM: the control code
