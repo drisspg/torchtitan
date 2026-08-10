@@ -134,6 +134,12 @@ class GraphTrainerCompileConfig(CompileConfig):
     on the Float32 GEMM accumulator instead of the rounded BFloat16 gate value,
     so losses are close to but not bitwise equal to the unfused graph."""
 
+    enable_flex_gemm_residual: bool = False
+    """Fuse Qwen3 attention and FFN output GEMMs with their residual adds.
+
+    This is independent from ``enable_flex_gemm_swiglu`` so each epilogue can
+    be measured and selected separately."""
+
     cpu_offload_prefetch_n_layers: int = 1
     """Prefetch reloads this many layers ahead in the backward graph
     to overlap H2D transfers with compute."""

@@ -24,6 +24,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 from torchtitan.experiments.graph_trainer.flex_gemm_passes import (
+    flex_gemm_residual_pass,
     flex_gemm_swiglu_pass,
     QUACK_KERNEL_OPTIONS,
 )
@@ -56,6 +57,11 @@ def swiglu_train_step(x, w1, w3, w2, dout):
     return out, d_gate, d_up
 
 
+def residual_step(x, weight, residual):
+    out = torch.mm(x.reshape(B * S, D), weight.t()).reshape(B, S, D)
+    return out + residual
+
+
 def make_inputs(dtype=torch.bfloat16, device="cuda"):
     generator = torch.Generator(device=device).manual_seed(42)
 
@@ -66,6 +72,17 @@ def make_inputs(dtype=torch.bfloat16, device="cuda"):
         ) / (D**0.5)
 
     return (normal(B, S, D), normal(H, D), normal(H, D), normal(D, H), normal(B, S, D))
+
+
+def make_residual_inputs(dtype=torch.bfloat16, device="cuda"):
+    generator = torch.Generator(device=device).manual_seed(42)
+
+    def normal(*shape):
+        return torch.randn(
+            *shape, generator=generator, device=device, dtype=dtype
+        ) / (D**0.5)
+
+    return normal(B, S, D), normal(D, D), normal(B, S, D)
 
 
 def traced(fn, *args):
@@ -89,6 +106,21 @@ class TestFlexGemmSwiGluPass(TestCase):
     def _rewrite(self, fn, *args):
         gm = traced(fn, *args)
         gm = flex_gemm_swiglu_pass(gm, fake_inputs(gm))
+        gm.graph.eliminate_dead_code()
+        gm.recompile()
+        return gm
+
+    def _rewrite_residual(self, module_fqn, *args):
+        gm = traced(residual_step, *args)
+        output_mm = next(
+            iter(
+                gm.graph.find_nodes(
+                    op="call_function", target=torch.ops.aten.mm.default
+                )
+            )
+        )
+        output_mm.meta.setdefault("custom", {})["module_fqn"] = module_fqn
+        gm = flex_gemm_residual_pass(gm, fake_inputs(gm))
         gm.graph.eliminate_dead_code()
         gm.recompile()
         return gm
@@ -195,6 +227,71 @@ class TestFlexGemmSwiGluPass(TestCase):
             reshaped.meta["custom"]["module_fqn"], "layers.0.feed_forward"
         )
         self.assertIsNot(fused.meta["custom"], gate_mm.meta.get("custom"))
+
+    def test_fuses_qwen3_output_gemm_with_residual(self):
+        """Attention and FFN output projections use the same residual rewrite."""
+        args = make_residual_inputs()
+        for module_fqn in (
+            "layers.0.attention.wo",
+            "layers.0.feed_forward.w2",
+        ):
+            with self.subTest(module_fqn=module_fqn):
+                rewritten = self._rewrite_residual(module_fqn, *args)
+                fused = flex_gemm_nodes(rewritten)
+                self.assertEqual(len(fused), 1)
+                self.assertEqual(
+                    fused[0].args[-1],
+                    QUACK_KERNEL_OPTIONS,
+                )
+                self.assertEqual(
+                    count_target(rewritten, torch.ops.aten.mm.default), 0
+                )
+                self.assertEqual(
+                    count_target(rewritten, torch.ops.aten.add.Tensor), 0
+                )
+                body = getattr(rewritten, fused[0].args[1].target)
+                targets = [
+                    node.target
+                    for node in body.graph.nodes
+                    if node.op == "call_function"
+                ]
+                self.assertEqual(
+                    targets,
+                    [torch.ops.aten.mm.default, torch.ops.aten.add.Tensor],
+                )
+                self.assertTrue(
+                    torch.equal(rewritten(*args), residual_step(*args))
+                )
+
+    def test_residual_rewrite_requires_qwen3_output_fqn(self):
+        """Do not turn arbitrary GEMM-plus-add graphs into FlexGEMM calls."""
+        rewritten = self._rewrite_residual(
+            "layers.0.attention.qkv_linear.wqkv",
+            *make_residual_inputs(),
+        )
+        self.assertEqual(flex_gemm_nodes(rewritten), [])
+
+    def test_residual_rewrite_rejects_shared_gemm_output(self):
+        """The residual rewrite cannot erase a GEMM with another reader."""
+
+        def shared_output(x, weight, residual):
+            out = torch.mm(x.reshape(B * S, D), weight.t())
+            return out.reshape(B, S, D) + residual, out
+
+        args = make_residual_inputs()
+        gm = traced(shared_output, *args)
+        output_mm = next(
+            iter(
+                gm.graph.find_nodes(
+                    op="call_function", target=torch.ops.aten.mm.default
+                )
+            )
+        )
+        output_mm.meta.setdefault("custom", {})["module_fqn"] = (
+            "layers.0.feed_forward.w2"
+        )
+        gm = flex_gemm_residual_pass(gm, fake_inputs(gm))
+        self.assertEqual(flex_gemm_nodes(gm), [])
 
     def test_no_match_when_forward_silu_is_saved(self):
         """A joint graph without activation remat keeps silu live; skip it."""

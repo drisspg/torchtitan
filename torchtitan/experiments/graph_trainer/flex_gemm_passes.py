@@ -4,7 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""FlexGEMM fusion of the dense SwiGLU forward site in the train-step graph.
+"""Qwen3 FlexGEMM rewrites for the full train-step graph.
+
+The passes cover the dense SwiGLU forward epilogue and independently fuse
+eligible attention/FFN output GEMMs with their residual adds.
 
 ``aot_fx_trace`` captures forward + loss + backward in one FX graph, so the
 backward of the SwiGLU block is already explicit aten code. That lets a plain
@@ -84,11 +87,7 @@ def install_flex_gemm_codegen_shim() -> None:
     def generate_kernel_call_helper(self, kernel_name, call_args, **kwargs):
         if kernel_name.startswith(_CUTEDSL_KERNEL_PREFIX):
             self.kernel_autotune_names.add(kernel_name)
-        try:
-            return original(self, kernel_name, call_args, **kwargs)
-        except AssertionError:
-            logger.info(f"DEBUG failing kernel {kernel_name} args={call_args}")
-            raise
+        return original(self, kernel_name, call_args, **kwargs)
 
     generate_kernel_call_helper._flex_gemm_shim = True
     PythonWrapperCodegen._generate_kernel_call_helper = generate_kernel_call_helper
@@ -108,6 +107,19 @@ class SwiGluSite:
     gate_mm: torch.fx.Node
     gate_views: tuple[torch.fx.Node, ...]
     up: torch.fx.Node
+
+
+@dataclass(frozen=True, slots=True)
+class ResidualSite:
+    """One Qwen3 output GEMM followed by its residual add."""
+
+    add: torch.fx.Node
+    output_mm: torch.fx.Node
+    output_views: tuple[torch.fx.Node, ...]
+    residual: torch.fx.Node
+
+
+_RESIDUAL_GEMM_FQN_SUFFIXES = (".attention.wo", ".feed_forward.w2")
 
 
 def _fake_val(node: torch.fx.Node) -> torch.Tensor | None:
@@ -165,6 +177,82 @@ def _view_source_with_shape(
         current = current.args[0]
         if not isinstance(current, torch.fx.Node):
             return None
+
+
+def _module_fqn(node: torch.fx.Node) -> str:
+    custom = node.meta.get("custom")
+    if not isinstance(custom, dict):
+        return ""
+    module_fqn = custom.get("module_fqn")
+    return module_fqn if isinstance(module_fqn, str) else ""
+
+
+def _output_gemm_chain(
+    output: torch.fx.Node, add: torch.fx.Node
+) -> tuple[torch.fx.Node, tuple[torch.fx.Node, ...]] | None:
+    """Walk a single-use view chain from an add input to its output GEMM."""
+    views: tuple[torch.fx.Node, ...] = ()
+    consumer = add
+    node = output
+    while node.target in _VIEW_TARGETS:
+        if not _has_single_user(node, consumer):
+            return None
+        views += (node,)
+        consumer = node
+        producer = node.args[0]
+        if not isinstance(producer, torch.fx.Node):
+            return None
+        node = producer
+    if node.target is not torch.ops.aten.mm.default:
+        return None
+    if not _has_single_user(node, consumer):
+        return None
+    return node, views
+
+
+def match_residual_site(add: torch.fx.Node) -> ResidualSite | None:
+    """Match a Qwen3 attention/FFN output GEMM followed by a residual add."""
+    if add.target is not torch.ops.aten.add.Tensor or len(add.args) != 2:
+        return None
+    if add.kwargs.get("alpha", 1) != 1:
+        return None
+
+    for output, residual in (add.args, add.args[::-1]):
+        if not isinstance(output, torch.fx.Node) or not isinstance(
+            residual, torch.fx.Node
+        ):
+            continue
+        chain = _output_gemm_chain(output, add)
+        if chain is None:
+            continue
+        output_mm, output_views = chain
+        if not _module_fqn(output_mm).endswith(_RESIDUAL_GEMM_FQN_SUFFIXES):
+            continue
+
+        gemm_val = _fake_val(output_mm)
+        residual_val = _fake_val(residual)
+        add_val = _fake_val(add)
+        if gemm_val is None or residual_val is None or add_val is None:
+            continue
+        gemm_shape = _static_shape(gemm_val)
+        if (
+            gemm_val.device.type != "cuda"
+            or gemm_shape is None
+            or len(gemm_shape) != 2
+            or add_val.numel() != gemm_val.numel()
+            or residual_val.numel() != gemm_val.numel()
+            or add_val.dtype is not gemm_val.dtype
+            or residual_val.dtype is not gemm_val.dtype
+            or residual_val.device != gemm_val.device
+        ):
+            continue
+        return ResidualSite(
+            add=add,
+            output_mm=output_mm,
+            output_views=output_views,
+            residual=residual,
+        )
+    return None
 
 
 def match_swiglu_site(
@@ -242,6 +330,25 @@ def _build_body_graph(
     return body_gm
 
 
+def _build_residual_body_graph(
+    a_val: torch.Tensor,
+    b_val: torch.Tensor,
+    residual_val: torch.Tensor,
+) -> torch.fx.GraphModule:
+    """Trace the FlexGEMM body ``mm(a, b) + residual``."""
+
+    def body(a, b, residual):
+        out = torch.ops.aten.add.Tensor(
+            torch.ops.aten.mm.default(a, b), residual
+        )
+        return (out,)
+
+    with a_val.fake_mode:
+        body_gm = make_fx(body)(a_val, b_val, residual_val)
+    mark_flex_gemm_body_gemm_node(body_gm, torch.ops.aten.mm.default)
+    return body_gm
+
+
 def _inherit_meta(node: torch.fx.Node, source: torch.fx.Node, val) -> None:
     """Carry the replaced node's provenance and annotations onto its rewrite."""
     node.meta.update({key: v for key, v in source.meta.items() if key != "val"})
@@ -296,6 +403,88 @@ def _fuse_site(gm: torch.fx.GraphModule, site: SwiGluSite, body_name: str) -> No
     # the matcher), so they can be redirected to the auxiliary output.
     site.gate_mm.replace_all_uses_with(gate)
     graph.erase_node(site.gate_mm)
+
+
+def _fuse_residual_site(
+    gm: torch.fx.GraphModule, site: ResidualSite, body_name: str
+) -> None:
+    """Replace one output GEMM plus residual add with ``flex_gemm``."""
+    graph = gm.graph
+    a_node, b_node = site.output_mm.args
+    a_val, b_val = (_fake_val(node) for node in (a_node, b_node))
+    residual_val = _fake_val(site.residual)
+    gemm_shape = tuple(site.output_mm.meta["val"].shape)
+    with a_val.fake_mode:
+        residual_2d_val = residual_val.reshape(gemm_shape)
+    body_gm = _build_residual_body_graph(a_val, b_val, residual_2d_val)
+    gm.register_module(body_name, body_gm)
+    with a_val.fake_mode:
+        (main_val,) = body_gm(a_val, b_val, residual_2d_val)
+    add_val = site.add.meta["val"]
+
+    with graph.inserting_before(site.add):
+        residual_2d = site.residual
+        if tuple(residual_val.shape) != gemm_shape:
+            residual_2d = graph.call_function(
+                torch.ops.aten.reshape.default,
+                (site.residual, list(gemm_shape)),
+            )
+            _inherit_meta(residual_2d, site.residual, residual_2d_val)
+        body_attr = graph.get_attr(body_name)
+        fused = graph.call_function(
+            flex_gemm_hop,
+            (
+                torch.ops.aten.mm.default,
+                body_attr,
+                (a_node, b_node, residual_2d),
+                {},
+                dict(QUACK_KERNEL_OPTIONS),
+            ),
+        )
+        main = graph.call_function(operator.getitem, (fused, 0))
+        out = main
+        if tuple(add_val.shape) != tuple(main_val.shape):
+            out = graph.call_function(
+                torch.ops.aten.reshape.default, (main, list(add_val.shape))
+            )
+
+    _inherit_meta(fused, site.add, (main_val,))
+    _inherit_meta(main, site.add, main_val)
+    if out is not main:
+        _inherit_meta(out, site.add, add_val)
+    site.add.replace_all_uses_with(out)
+    graph.erase_node(site.add)
+    for view in site.output_views:
+        graph.erase_node(view)
+    graph.erase_node(site.output_mm)
+
+
+def flex_gemm_residual_pass(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple | None = None,
+) -> torch.fx.GraphModule:
+    """Fuse Qwen3 attention/FFN output GEMMs with their residual adds."""
+    sites = [
+        site
+        for node in gm.graph.find_nodes(
+            op="call_function", target=torch.ops.aten.add.Tensor
+        )
+        if (site := match_residual_site(node)) is not None
+    ]
+    if not sites:
+        logger.info("flex_gemm_residual_pass: no eligible Qwen3 residual site")
+        return gm
+
+    install_flex_gemm_codegen_shim()
+    for index, site in enumerate(sites):
+        _fuse_residual_site(gm, site, f"flex_gemm_residual_body_{index}")
+    gm.graph.lint()
+    gm.recompile()
+    logger.info(
+        f"flex_gemm_residual_pass: fused {len(sites)} Qwen3 output GEMMs "
+        f"with residual adds using kernel_options={QUACK_KERNEL_OPTIONS}"
+    )
+    return gm
 
 
 def flex_gemm_swiglu_pass(
