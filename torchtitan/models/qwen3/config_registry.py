@@ -232,6 +232,41 @@ def qwen3_1_7b() -> Trainer.Config:
     )
 
 
+def qwen3_8b() -> Trainer.Config:
+    model_spec = model_registry("8B")
+    return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        ),
+        hf_assets_path="./assets/hf/Qwen3-8B",
+        model_spec=model_spec,
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="c4",
+        ),
+        optimizer=default_adamw(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(warmup_steps=600),
+        training=TrainingConfig(
+            local_batch_size=4,
+            seq_len=4096,
+            steps=3000,
+        ),
+        parallelism=ParallelismConfig(
+            data_parallel_shard_degree=-1,
+            tensor_parallel_degree=1,
+            context_parallel_degree=1,
+            pipeline_parallel_degree=1,
+        ),
+        checkpoint=CheckpointManager.Config(
+            interval=500,
+            last_save_model_only=False,
+            export_dtype="float16",
+        ),
+        activation_checkpoint=FullAC.Config(),
+    )
+
+
 def qwen3_8b_first_85_pct_layers_nvfp4() -> Trainer.Config:
     config = sft_qwen3_8b_math()
     config.parallelism.spmd_backend = "spmd_types"

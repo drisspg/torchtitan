@@ -130,10 +130,17 @@ class GraphTrainerCompileConfig(CompileConfig):
 
     Requires a PyTorch build with the FlexGEMM HOP plus its CuTeDSL/QuACK
     dependencies, an SM100+ GPU, and ``--compile.inductor_compilation full`` so
-    the terminal Inductor pass lowers the HOP. The fused epilogue uses the
-    fast-math tanh SiLU identity on the Float32 GEMM accumulator instead of the
-    standard SiLU on the rounded BFloat16 gate value, so losses are close to but
-    not bitwise equal to the unfused graph."""
+    the terminal Inductor pass lowers the HOP. The stock feed-forward layout
+    uses fast-math SiLU on the Float32 accumulator. With TorchTitan's
+    ``fused_swiglu`` override, the pass instead contracts the packed gate/up
+    projection, preserves its physical output for backward, and rounds through
+    BFloat16 before exact SiLU so the training trajectory remains unchanged."""
+
+    enable_packed_w13_wgrad_layout: bool = False
+    """Orient fused-SwiGLU W13 weight gradients to match parameter layout.
+
+    This algebraic rewrite avoids the per-step materialization copy otherwise
+    required for the transposed packed gradient returned by the traced graph."""
 
     enable_flex_gemm_residual: bool = False
     """Fuse Qwen3 attention and FFN output GEMMs with their residual adds.

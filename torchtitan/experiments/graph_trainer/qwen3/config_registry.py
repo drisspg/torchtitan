@@ -12,6 +12,7 @@ from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.models.qwen3.config_registry import (
     qwen3_0_6b,
     qwen3_14b,
+    qwen3_8b,
     qwen3_debugmodel,
     qwen3_moe_debug,
 )
@@ -34,6 +35,41 @@ def graph_trainer_qwen3_debugmodel_moe() -> GraphTrainer.Config:
 def graph_trainer_qwen3_0_6b() -> GraphTrainer.Config:
     config = to_graph_trainer_config(qwen3_0_6b(), model_registry)
     config.compile = GraphTrainerCompileConfig(enable=True)
+    return config
+
+
+def graph_trainer_qwen3_0_6b_flex_gemm() -> GraphTrainer.Config:
+    config = graph_trainer_qwen3_0_6b()
+    config.compile.enable_flex_gemm_swiglu = True
+    config.compile.enable_flex_gemm_cross_entropy = True
+    return config
+
+
+def graph_trainer_qwen3_8b() -> GraphTrainer.Config:
+    config = to_graph_trainer_config(qwen3_8b(), model_registry)
+    # This workload leaves enough headroom for full-graph compilation on one B200.
+    config.training.local_batch_size = 2
+    config.training.seq_len = 1024
+    config.compile = GraphTrainerCompileConfig(enable=True)
+    return config
+
+
+def graph_trainer_qwen3_8b_fused_swiglu() -> GraphTrainer.Config:
+    config = graph_trainer_qwen3_8b()
+    config.override.imports.append("torchtitan.overrides.fused_swiglu.fused_swiglu")
+    return config
+
+
+def graph_trainer_qwen3_8b_optimized() -> GraphTrainer.Config:
+    config = graph_trainer_qwen3_8b_fused_swiglu()
+    config.compile.enable_packed_w13_wgrad_layout = True
+    return config
+
+
+def graph_trainer_qwen3_8b_flex_gemm() -> GraphTrainer.Config:
+    config = graph_trainer_qwen3_8b_fused_swiglu()
+    config.compile.enable_flex_gemm_swiglu = True
+    config.compile.enable_flex_gemm_cross_entropy = True
     return config
 
 

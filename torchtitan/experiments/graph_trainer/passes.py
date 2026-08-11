@@ -337,6 +337,13 @@ def compile_time_passes(
     if config.parallelism.enable_async_tensor_parallel:
         passes.append(async_tensor_parallel_pass)
 
+    if config.compile.enable_packed_w13_wgrad_layout:
+        from torchtitan.experiments.graph_trainer.flex_gemm_passes import (
+            packed_w13_wgrad_layout_pass,
+        )
+
+        passes.append(packed_w13_wgrad_layout_pass)
+
     if config.compile.enable_flex_gemm_swiglu:
         # Model-shape-aware rewrite: it must see the post-remat graph and must
         # run before the terminal Inductor pass that lowers the FlexGEMM HOP.

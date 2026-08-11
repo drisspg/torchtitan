@@ -6,36 +6,37 @@
 
 """Qwen3 FlexGEMM rewrites for the full train-step graph.
 
-The passes cover dense SwiGLU forward, attention/FFN output residual adds,
-and chunked LM-head cross entropy with its explicit backward.
+The passes cover dense SwiGLU forward and backward, attention/FFN output
+residual adds, and chunked LM-head cross entropy with its explicit backward.
 
 ``aot_fx_trace`` captures forward + loss + backward in one FX graph, so the
-backward of the SwiGLU block is already explicit aten code. That lets a plain
-graph pass fuse the forward side without any custom ``autograd.Function``: the
-pass rewrites
+backward of the SwiGLU block is already explicit aten code. The pass handles
+both TorchTitan feed-forward layouts. The stock layout rewrites
 
     gate = mm(x, w1_t)            # gate projection
     out  = silu(gate) * up        # up = mm(x, w3_t)
 
-into a single ``flex_gemm`` HOP that runs the gate GEMM with a QUACK epilogue.
-``up`` becomes a captured ``[M, N]`` epilogue tensor and the gate accumulator is
-returned as a full-shape auxiliary output, because the traced backward reads the
-saved gate value (``silu_backward``) and the saved up value. Returning the gate
-as an auxiliary is what keeps the rewrite work-neutral: without it the standalone
-gate GEMM would have to stay live for the backward, leaving two gate GEMMs.
+into a ``flex_gemm`` HOP that captures ``up`` and returns the saved gate as an
+auxiliary. The ``fused_swiglu`` override instead computes interleaved gate/up
+lanes with one singleton-batch BMM. That pattern is canonicalized to a 2-D MM;
+its FlexGEMM epilogue contracts each lane pair into the logical SwiGLU output
+and returns the unchanged packed GEMM result for the explicit backward. Both
+forms therefore remove the standalone activation kernel without duplicating a
+projection GEMM.
 
 The cross-entropy pass similarly moves target-logit gather and group-64 online
 logsumexp onto each LM-head GEMM. A small final reduction computes the summed
 loss, while a pointwise expression replaces NLL and log-softmax backward. This
 removes the full Float32 log-probability tensor from the joint graph.
 
-Numerics: FlexGEMM evaluates epilogues on the Float32 GEMM accumulator. SwiGLU
-also uses its fast-math tanh identity, while the original graph applies SiLU to
-the rounded BFloat16 gate. Cross entropy explicitly rounds the accumulator to
-BFloat16 before its target gather, LSE, and backward so all three use one
-coherent logits value. Its grouped LSE uses fast math and can still differ
-slightly from the original reduction order. All three passes are opt-in for
-that reason.
+Numerics: the stock-layout SwiGLU rewrite evaluates its fast-math SiLU on the
+Float32 GEMM accumulator. The packed override rewrite explicitly rounds the
+accumulator through BFloat16 and uses exact math, preserving the custom op's
+activation boundary while still returning the identical packed backward state.
+Cross entropy similarly rounds the accumulator before its target gather, LSE,
+and backward so all three use one coherent logits value. Its grouped LSE uses
+fast math and can still differ slightly from the original reduction order. All
+three passes remain opt-in.
 
 NOTE [FlexGEMM kernels and compile-time autotuning]
 ``standalone_compile``, which backs both regional and full Inductor compilation,
@@ -119,6 +120,24 @@ class SwiGluSite:
     gate_mm: torch.fx.Node
     gate_views: tuple[torch.fx.Node, ...]
     up: torch.fx.Node
+
+
+@dataclass(frozen=True, slots=True)
+class PackedSwiGluSite:
+    """One fused-override forward SwiGLU consumer of a packed BMM."""
+
+    swiglu: torch.fx.Node
+    packed_bmm: torch.fx.Node
+
+
+@dataclass(frozen=True, slots=True)
+class PackedW13WgradLayoutSite:
+    """One packed W13 weight-gradient BMM with a strided parameter output."""
+
+    cast: torch.fx.Node
+    bmm: torch.fx.Node
+    x_batched: torch.fx.Node
+    grad_batched: torch.fx.Node
 
 
 @dataclass(frozen=True, slots=True)
@@ -521,6 +540,210 @@ def match_cross_entropy_site(log_softmax: torch.fx.Node) -> CrossEntropySite | N
     )
 
 
+def _packed_lane_source(
+    node: torch.fx.Node,
+) -> tuple[torch.fx.Node, int] | None:
+    """Return the shared unbind and lane index feeding a packed SwiGLU input."""
+    while node.target in _VIEW_TARGETS:
+        producer = node.args[0]
+        if not isinstance(producer, torch.fx.Node):
+            return None
+        node = producer
+    if (
+        node.target is not operator.getitem
+        or len(node.args) != 2
+        or not isinstance(node.args[0], torch.fx.Node)
+        or not isinstance(node.args[1], int)
+    ):
+        return None
+    unbind, index = node.args
+    if unbind.target is not torch.ops.aten.unbind.int:
+        return None
+    return unbind, index
+
+
+def _packed_bmm_source(unbind: torch.fx.Node) -> torch.fx.Node | None:
+    """Follow the override's post-contraction views back to its packed BMM."""
+    node = unbind.args[0]
+    while isinstance(node, torch.fx.Node) and node.target in (
+        *_VIEW_TARGETS,
+        torch.ops.aten.permute.default,
+    ):
+        node = node.args[0]
+    if not isinstance(node, torch.fx.Node):
+        return None
+    return node if node.target is torch.ops.aten.bmm.default else None
+
+
+def match_packed_swiglu_site(swiglu: torch.fx.Node) -> PackedSwiGluSite | None:
+    """Match one interleaved packed projection followed by exact SwiGLU.
+
+    The override's lane tensor must be contiguous with trailing shape ``[H, 2]``.
+    Together with the singleton BMM batch and equal element counts, that proves
+    physical columns are ordered ``gate0, up0, gate1, up1, ...``. The explicit
+    backward may keep reading those lanes after the forward activation is fused.
+    """
+    schema = getattr(swiglu.target, "_schema", None)
+    if (
+        schema is None
+        or schema.name != "torchtitan::silu_and_mul"
+        or len(swiglu.args) < 2
+        or not all(isinstance(arg, torch.fx.Node) for arg in swiglu.args[:2])
+        or (len(swiglu.args) > 2 and swiglu.args[2] is not None)
+        or swiglu.kwargs.get("offsets") is not None
+    ):
+        return None
+    gate, up = swiglu.args[:2]
+    gate_lane = _packed_lane_source(gate)
+    up_lane = _packed_lane_source(up)
+    if gate_lane is None or up_lane is None:
+        return None
+    gate_unbind, gate_index = gate_lane
+    up_unbind, up_index = up_lane
+    if gate_unbind is not up_unbind or (gate_index, up_index) != (0, 1):
+        return None
+
+    packed_bmm = _packed_bmm_source(gate_unbind)
+    if packed_bmm is None:
+        return None
+    packed_val = _fake_val(packed_bmm)
+    gate_val = _fake_val(gate)
+    up_val = _fake_val(up)
+    swiglu_val = _fake_val(swiglu)
+    lane_source = gate_unbind.args[0]
+    lane_source_val = (
+        _fake_val(lane_source) if isinstance(lane_source, torch.fx.Node) else None
+    )
+    if (
+        packed_val is None
+        or gate_val is None
+        or up_val is None
+        or swiglu_val is None
+        or lane_source_val is None
+    ):
+        return None
+    packed_shape = _static_shape(packed_val)
+    gate_shape = _static_shape(gate_val)
+    lane_source_shape = _static_shape(lane_source_val)
+    if (
+        packed_val.device.type != "cuda"
+        or packed_shape is None
+        or len(packed_shape) != 3
+        or packed_shape[0] != 1
+        or gate_shape is None
+        or len(gate_shape) != 2
+        or packed_shape[1] != gate_shape[0]
+        or packed_shape[2] != 2 * gate_shape[1]
+        or lane_source_shape is None
+        or lane_source_shape[-2:] != (gate_shape[1], 2)
+        or lane_source_val.numel() != packed_val.numel()
+        or not lane_source_val.is_contiguous()
+        or up_val.shape != gate_val.shape
+        or swiglu_val.shape != gate_val.shape
+        or up_val.dtype is not gate_val.dtype
+        or swiglu_val.dtype is not gate_val.dtype
+        or packed_val.dtype is not gate_val.dtype
+    ):
+        return None
+
+    lhs_val, rhs_val = (_fake_val(arg) for arg in packed_bmm.args)
+    if lhs_val is None or rhs_val is None:
+        return None
+    lhs_shape = _static_shape(lhs_val)
+    rhs_shape = _static_shape(rhs_val)
+    if (
+        lhs_shape is None
+        or rhs_shape is None
+        or lhs_shape[:2] != (1, packed_shape[1])
+        or rhs_shape != (1, lhs_shape[2], packed_shape[2])
+        or lhs_val.dtype is not packed_val.dtype
+        or rhs_val.dtype is not packed_val.dtype
+        or lhs_val.device != packed_val.device
+        or rhs_val.device != packed_val.device
+    ):
+        return None
+    return PackedSwiGluSite(swiglu=swiglu, packed_bmm=packed_bmm)
+
+
+def match_packed_w13_wgrad_layout_site(
+    cast: torch.fx.Node,
+) -> PackedW13WgradLayoutSite | None:
+    """Match the packed W13 wgrad chain that returns a strided parameter grad."""
+    if not _is_exact_dtype_cast(cast, torch.float32):
+        return None
+    cast_val = _fake_val(cast)
+    if cast_val is None:
+        return None
+    cast_shape = _static_shape(cast_val)
+    if cast_shape is None or len(cast_shape) != 3 or cast_shape[1] != 2:
+        return None
+
+    consumer = cast
+    node = cast.args[0]
+    layout_targets = (
+        *_VIEW_TARGETS,
+        torch.ops.aten.permute.default,
+        torch.ops.aten.squeeze.dim,
+    )
+    while isinstance(node, torch.fx.Node) and node.target in layout_targets:
+        if not _has_single_user(node, consumer):
+            return None
+        consumer = node
+        node = node.args[0]
+    if (
+        not isinstance(node, torch.fx.Node)
+        or node.target is not torch.ops.aten.bmm.default
+        or not _has_single_user(node, consumer)
+        or not _module_fqn(node).endswith(".feed_forward")
+    ):
+        return None
+    bmm = node
+    lhs, grad_batched = bmm.args
+    if (
+        not isinstance(lhs, torch.fx.Node)
+        or not isinstance(grad_batched, torch.fx.Node)
+        or lhs.target is not torch.ops.aten.transpose.int
+        or lhs.args[1:] != (1, 2)
+        or not isinstance(lhs.args[0], torch.fx.Node)
+    ):
+        return None
+    x_batched = lhs.args[0]
+    x_val, grad_val, bmm_val = (
+        _fake_val(value) for value in (x_batched, grad_batched, bmm)
+    )
+    if x_val is None or grad_val is None or bmm_val is None:
+        return None
+    x_shape, grad_shape, bmm_shape = (
+        _static_shape(value) for value in (x_val, grad_val, bmm_val)
+    )
+    h, lanes, d = cast_shape
+    if (
+        x_shape is None
+        or grad_shape is None
+        or bmm_shape is None
+        or x_shape[0] != 1
+        or grad_shape[0] != 1
+        or x_shape[1] != grad_shape[1]
+        or x_shape[2] != d
+        or grad_shape[2] != lanes * h
+        or bmm_shape != (1, d, lanes * h)
+        or any(value.device.type != "cuda" for value in (x_val, grad_val, bmm_val))
+        or len({x_val.device, grad_val.device, bmm_val.device}) != 1
+        or any(
+            value.dtype is not torch.bfloat16 for value in (x_val, grad_val, bmm_val)
+        )
+        or cast_val.device != bmm_val.device
+        or cast_val.dtype is not torch.float32
+    ):
+        return None
+    return PackedW13WgradLayoutSite(
+        cast=cast,
+        bmm=bmm,
+        x_batched=x_batched,
+        grad_batched=grad_batched,
+    )
+
+
 def match_swiglu_site(
     mul: torch.fx.Node, node_order: dict[torch.fx.Node, int]
 ) -> SwiGluSite | None:
@@ -590,6 +813,29 @@ def _build_body_graph(
 
     with a_val.fake_mode:
         body_gm = make_fx(body)(a_val, b_val, up_val)
+    mark_flex_gemm_body_gemm_node(body_gm, torch.ops.aten.mm.default)
+    return body_gm
+
+
+def _build_packed_swiglu_body_graph(
+    a_val: torch.Tensor,
+    b_val: torch.Tensor,
+    logical_n: int,
+) -> torch.fx.GraphModule:
+    """Trace interleaved packed MM -> SwiGLU plus the saved packed result."""
+    m = a_val.shape[0]
+
+    def body(a, b):
+        packed = torch.ops.aten.mm.default(a, b)
+        rounded = _round_bfloat16_to_float(packed.float())
+        lanes = rounded.view(m, logical_n, 2)
+        gate = lanes.select(-1, 0)
+        up = lanes.select(-1, 1)
+        main = torch.ops.aten.mul.Tensor(torch.ops.aten.silu.default(gate), up)
+        return main.to(packed.dtype), packed
+
+    with a_val.fake_mode:
+        body_gm = make_fx(body)(a_val, b_val)
     mark_flex_gemm_body_gemm_node(body_gm, torch.ops.aten.mm.default)
     return body_gm
 
@@ -774,6 +1020,120 @@ def _fuse_site(gm: torch.fx.GraphModule, site: SwiGluSite, body_name: str) -> No
     # the matcher), so they can be redirected to the auxiliary output.
     site.gate_mm.replace_all_uses_with(gate)
     graph.erase_node(site.gate_mm)
+
+
+def _fuse_packed_swiglu_site(
+    gm: torch.fx.GraphModule,
+    site: PackedSwiGluSite,
+    body_name: str,
+) -> None:
+    """Replace one packed BMM plus custom SwiGLU with grouped-main FlexGEMM."""
+    graph = gm.graph
+    lhs, rhs = site.packed_bmm.args
+    lhs_val, rhs_val = (_fake_val(node) for node in (lhs, rhs))
+    packed_bmm_val = _fake_val(site.packed_bmm)
+    swiglu_val = _fake_val(site.swiglu)
+    m, k = lhs_val.shape[-2:]
+    physical_n = rhs_val.shape[-1]
+    logical_n = physical_n // 2
+    with lhs_val.fake_mode:
+        lhs_2d_val = lhs_val.reshape(m, k)
+        rhs_2d_val = rhs_val.reshape(k, physical_n)
+    body_gm = _build_packed_swiglu_body_graph(
+        lhs_2d_val,
+        rhs_2d_val,
+        logical_n,
+    )
+    gm.register_module(body_name, body_gm)
+    with lhs_val.fake_mode:
+        main_val, packed_val = body_gm(lhs_2d_val, rhs_2d_val)
+
+    with graph.inserting_before(site.packed_bmm):
+        lhs_2d = graph.call_function(torch.ops.aten.reshape.default, (lhs, [m, k]))
+        rhs_2d = graph.call_function(
+            torch.ops.aten.reshape.default, (rhs, [k, physical_n])
+        )
+        body_attr = graph.get_attr(body_name)
+        fused = graph.call_function(
+            flex_gemm_hop,
+            (
+                torch.ops.aten.mm.default,
+                body_attr,
+                (lhs_2d, rhs_2d),
+                {},
+                # Exact math plus the explicit BF16 round preserves the
+                # fused_swiglu override's activation boundary.
+                dict(QUACK_KERNEL_OPTIONS),
+            ),
+        )
+        main = graph.call_function(operator.getitem, (fused, 0))
+        packed = graph.call_function(operator.getitem, (fused, 1))
+        packed_bmm = graph.call_function(
+            torch.ops.aten.reshape.default,
+            (packed, list(packed_bmm_val.shape)),
+        )
+
+    _inherit_meta(lhs_2d, lhs, lhs_2d_val)
+    _inherit_meta(rhs_2d, rhs, rhs_2d_val)
+    _inherit_meta(fused, site.packed_bmm, (main_val, packed_val))
+    _inherit_meta(main, site.swiglu, swiglu_val)
+    _inherit_meta(packed, site.packed_bmm, packed_val)
+    _inherit_meta(packed_bmm, site.packed_bmm, packed_bmm_val)
+
+    site.swiglu.replace_all_uses_with(main)
+    graph.erase_node(site.swiglu)
+    site.packed_bmm.replace_all_uses_with(packed_bmm)
+    graph.erase_node(site.packed_bmm)
+
+
+def _rewrite_packed_w13_wgrad_layout(
+    gm: torch.fx.GraphModule,
+    site: PackedW13WgradLayoutSite,
+) -> None:
+    """Produce the packed W13 gradient directly in parameter layout."""
+    graph = gm.graph
+    x_val = _fake_val(site.x_batched)
+    grad_val = _fake_val(site.grad_batched)
+    cast_val = _fake_val(site.cast)
+    _, m, d = x_val.shape
+    h, lanes, _ = cast_val.shape
+    physical_n = h * lanes
+    with x_val.fake_mode:
+        x_2d_val = x_val.reshape(m, d)
+        grad_2d_val = grad_val.reshape(m, physical_n)
+        grad_t_val = grad_2d_val.t()
+        wgrad_val = torch.mm(grad_t_val, x_2d_val)
+        packed_val = wgrad_val.reshape(h, lanes, d)
+        output_val = packed_val.to(torch.float32)
+
+    with graph.inserting_before(site.cast):
+        x_2d = graph.call_function(
+            torch.ops.aten.reshape.default,
+            (site.x_batched, [m, d]),
+        )
+        grad_2d = graph.call_function(
+            torch.ops.aten.reshape.default,
+            (site.grad_batched, [m, physical_n]),
+        )
+        grad_t = graph.call_function(torch.ops.aten.t.default, (grad_2d,))
+        wgrad = graph.call_function(torch.ops.aten.mm.default, (grad_t, x_2d))
+        packed = graph.call_function(
+            torch.ops.aten.reshape.default,
+            (wgrad, [h, lanes, d]),
+        )
+        output = graph.call_function(
+            torch.ops.aten._to_copy.default,
+            (packed,),
+            {"dtype": torch.float32},
+        )
+
+    _inherit_meta(x_2d, site.x_batched, x_2d_val)
+    _inherit_meta(grad_2d, site.grad_batched, grad_2d_val)
+    _inherit_meta(grad_t, site.grad_batched, grad_t_val)
+    _inherit_meta(wgrad, site.bmm, wgrad_val)
+    _inherit_meta(packed, site.cast, packed_val)
+    _inherit_meta(output, site.cast, output_val)
+    site.cast.replace_all_uses_with(output)
 
 
 def _fuse_residual_site(
@@ -976,6 +1336,37 @@ def flex_gemm_residual_pass(
     return gm
 
 
+def packed_w13_wgrad_layout_pass(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple | None = None,
+) -> torch.fx.GraphModule:
+    """Orient packed W13 wgrad GEMMs to return parameter-layout gradients."""
+    sites = [
+        site
+        for node in gm.graph.find_nodes(
+            op="call_function", target=torch.ops.aten._to_copy.default
+        )
+        if (site := match_packed_w13_wgrad_layout_site(node)) is not None
+    ]
+    if not sites:
+        logger.warning(
+            "packed_w13_wgrad_layout_pass was enabled but found no eligible "
+            "packed W13 weight-gradient site"
+        )
+        return gm
+
+    for site in sites:
+        _rewrite_packed_w13_wgrad_layout(gm, site)
+    gm.graph.eliminate_dead_code()
+    gm.graph.lint()
+    gm.recompile()
+    logger.info(
+        f"packed_w13_wgrad_layout_pass: rewrote {len(sites)} packed W13 "
+        "weight-gradient sites to parameter layout"
+    )
+    return gm
+
+
 def flex_gemm_swiglu_pass(
     gm: torch.fx.GraphModule,
     example_inputs: tuple | None = None,
@@ -983,10 +1374,18 @@ def flex_gemm_swiglu_pass(
     """Fuse eligible dense SwiGLU forward sites into QUACK ``flex_gemm`` calls.
 
     Must run before the terminal Inductor pass, which owns the graph once it
-    collapses into a compiled artifact. Sites that do not match the exact
-    contract in :func:`match_swiglu_site` are left untouched.
+    collapses into a compiled artifact. Sites that do not match either exact
+    feed-forward layout contract are left untouched.
     """
     node_order = {node: index for index, node in enumerate(gm.graph.nodes)}
+    packed_sites_by_bmm: dict[torch.fx.Node, PackedSwiGluSite] = {}
+    for node in gm.graph.nodes:
+        site = match_packed_swiglu_site(node)
+        if site is not None:
+            # Fuse only the first activation consumer. Later consumers are
+            # activation-remat recomputations that should stay short-lived.
+            packed_sites_by_bmm.setdefault(site.packed_bmm, site)
+    packed_sites = list(packed_sites_by_bmm.values())
     sites = [
         site
         for node in gm.graph.find_nodes(
@@ -994,17 +1393,24 @@ def flex_gemm_swiglu_pass(
         )
         if (site := match_swiglu_site(node, node_order)) is not None
     ]
-    if not sites:
+    if not packed_sites and not sites:
         logger.info("flex_gemm_swiglu_pass: no eligible dense SwiGLU site")
         return gm
 
     install_flex_gemm_codegen_shim()
+    for index, site in enumerate(packed_sites):
+        _fuse_packed_swiglu_site(
+            gm,
+            site,
+            f"flex_gemm_packed_swiglu_body_{index}",
+        )
     for index, site in enumerate(sites):
         _fuse_site(gm, site, f"flex_gemm_swiglu_body_{index}")
     gm.graph.lint()
     gm.recompile()
     logger.info(
-        f"flex_gemm_swiglu_pass: fused {len(sites)} dense SwiGLU sites into "
-        f"flex_gemm with kernel_options={QUACK_SWIGLU_KERNEL_OPTIONS}"
+        "flex_gemm_swiglu_pass: fused "
+        f"{len(packed_sites)} packed and {len(sites)} separate dense SwiGLU "
+        "sites with tuned QUACK kernels"
     )
     return gm

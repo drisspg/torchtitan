@@ -27,6 +27,7 @@ from torchtitan.experiments.graph_trainer.flex_gemm_passes import (
     flex_gemm_cross_entropy_pass,
     flex_gemm_residual_pass,
     flex_gemm_swiglu_pass,
+    packed_w13_wgrad_layout_pass,
     QUACK_CROSS_ENTROPY_KERNEL_OPTIONS,
     QUACK_KERNEL_OPTIONS,
     QUACK_SWIGLU_KERNEL_OPTIONS,
@@ -34,6 +35,7 @@ from torchtitan.experiments.graph_trainer.flex_gemm_passes import (
 from torchtitan.experiments.graph_trainer.inductor_passes import (
     full_inductor_compilation_pass,
 )
+from torchtitan.overrides.fused_swiglu import silu_and_mul_op
 from torchtitan.tools.utils import has_cuda_capability
 
 B, S, D, H = 2, 256, 512, 1024
@@ -59,6 +61,29 @@ def swiglu_train_step(x, w1, w3, w2, dout):
     d_up = d_fused * F.silu(gate)
     d_gate = torch.ops.aten.silu_backward(d_fused * up, gate)
     return out, d_gate, d_up
+
+
+def packed_swiglu_train_step(x, w13, w2, dout):
+    """Fused-override SwiGLU forward plus its explicit custom-op backward."""
+    gate, up = torch.einsum("bsd,hgd->bshg", x, w13).unbind(-1)
+    gate_2d = gate.reshape(B * S, H)
+    up_2d = up.reshape(B * S, H)
+    fused_2d = silu_and_mul_op(gate_2d, up_2d)
+    out = torch.mm(fused_2d, w2.t()).reshape(B, S, D)
+
+    d_fused = torch.mm(dout.reshape(B * S, D), w2)
+    d_gate, d_up = torch.ops.torchtitan.silu_and_mul_backward.default(
+        d_fused, gate_2d, up_2d
+    )
+    return out, d_gate, d_up
+
+
+def packed_w13_wgrad_step(x, packed_grad):
+    """Return the packed W13 gradient through the traced einsum layout."""
+    x_batched = x.reshape(1, B * S, D)
+    grad_batched = packed_grad.reshape(1, B * S, 2 * H)
+    wgrad = torch.bmm(x_batched.transpose(1, 2), grad_batched)
+    return wgrad.squeeze(0).reshape(D, H, 2).permute(1, 2, 0).to(torch.float32)
 
 
 def residual_step(x, weight, residual):
@@ -95,6 +120,28 @@ def make_inputs(dtype=torch.bfloat16, device="cuda"):
         )
 
     return (normal(B, S, D), normal(H, D), normal(H, D), normal(D, H), normal(B, S, D))
+
+
+def make_packed_inputs(dtype=torch.bfloat16, device="cuda"):
+    generator = torch.Generator(device=device).manual_seed(42)
+
+    def normal(*shape):
+        return torch.randn(*shape, generator=generator, device=device, dtype=dtype) / (
+            D**0.5
+        )
+
+    return normal(B, S, D), normal(H, 2, D), normal(D, H), normal(B, S, D)
+
+
+def make_w13_wgrad_inputs(dtype=torch.bfloat16, device="cuda"):
+    generator = torch.Generator(device=device).manual_seed(42)
+    x = torch.randn(B, S, D, generator=generator, device=device, dtype=dtype) / (
+        D**0.5
+    )
+    packed_grad = torch.randn(
+        B * S, 2 * H, generator=generator, device=device, dtype=dtype
+    ) / (D**0.5)
+    return x, packed_grad
 
 
 def make_cross_entropy_inputs(device="cuda", grad_scale=1 / 2048):
@@ -148,6 +195,21 @@ class TestFlexGemmSwiGluPass(TestCase):
         gm.recompile()
         return gm
 
+    def _rewrite_w13_wgrad_layout(self, *args):
+        gm = traced(packed_w13_wgrad_step, *args)
+        bmm = next(
+            iter(
+                gm.graph.find_nodes(
+                    op="call_function", target=torch.ops.aten.bmm.default
+                )
+            )
+        )
+        bmm.meta.setdefault("custom", {})["module_fqn"] = "layers.0.feed_forward"
+        gm = packed_w13_wgrad_layout_pass(gm, fake_inputs(gm))
+        gm.graph.eliminate_dead_code()
+        gm.recompile()
+        return gm
+
     def _rewrite_residual(self, module_fqn, *args):
         gm = traced(residual_step, *args)
         output_mm = next(
@@ -185,6 +247,103 @@ class TestFlexGemmSwiGluPass(TestCase):
         self.assertEqual(count_target(rewritten, torch.ops.aten.mul.Tensor), 2)
         self.assertEqual(
             count_target(rewritten, torch.ops.aten.mm.default), gemms_before - 1
+        )
+
+    def test_fuses_packed_override_swiglu_site(self):
+        """The packed projection and custom activation become one FlexGEMM."""
+        args = make_packed_inputs()
+        gm = traced(packed_swiglu_train_step, *args)
+        bmm_before = count_target(gm, torch.ops.aten.bmm.default)
+        rewritten = self._rewrite(packed_swiglu_train_step, *args)
+
+        fused = flex_gemm_nodes(rewritten)
+        self.assertEqual(len(fused), 1)
+        gemm_op, _, gemm_args, _, kernel_options = fused[0].args
+        self.assertIs(gemm_op, torch.ops.aten.mm.default)
+        self.assertEqual(len(gemm_args), 2)
+        self.assertEqual(kernel_options, QUACK_KERNEL_OPTIONS)
+        self.assertEqual(
+            count_target(rewritten, torch.ops.aten.bmm.default), bmm_before - 1
+        )
+        self.assertEqual(
+            count_target(rewritten, torch.ops.torchtitan.silu_and_mul.default), 0
+        )
+
+        body = getattr(rewritten, fused[0].args[1].target)
+        body_output = next(iter(body.graph.find_nodes(op="output"))).args[0]
+        self.assertIs(body_output[1].target, torch.ops.aten.mm.default)
+
+        actual = rewritten(*args)
+        expected = packed_swiglu_train_step(*args)
+        for candidate, reference in zip(actual, expected):
+            self.assertTrue(torch.equal(candidate, reference))
+
+    def test_reorients_packed_w13_weight_gradient(self):
+        """The W13 wgrad GEMM directly produces contiguous parameter layout."""
+        args = make_w13_wgrad_inputs()
+        rewritten = self._rewrite_w13_wgrad_layout(*args)
+
+        self.assertEqual(count_target(rewritten, torch.ops.aten.bmm.default), 0)
+        self.assertEqual(count_target(rewritten, torch.ops.aten.mm.default), 1)
+        actual = rewritten(*args)
+        expected = packed_w13_wgrad_step(*args)
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertTrue(actual.is_contiguous())
+        self.assertEqual(actual.stride(), (2 * D, D, 1))
+
+    def test_packed_override_preserves_activation_remat(self):
+        """Only the forward activation is fused; its remat consumer remains."""
+
+        def repeated_activation(x, w13):
+            gate, up = torch.einsum("bsd,hgd->bshg", x, w13).unbind(-1)
+            gate = gate.reshape(B * S, H)
+            up = up.reshape(B * S, H)
+            return silu_and_mul_op(gate, up), silu_and_mul_op(gate, up)
+
+        x, w13, _, _ = make_packed_inputs()
+        args = x, w13
+        rewritten = self._rewrite(repeated_activation, *args)
+
+        self.assertEqual(len(flex_gemm_nodes(rewritten)), 1)
+        self.assertEqual(
+            count_target(rewritten, torch.ops.torchtitan.silu_and_mul.default), 1
+        )
+        for candidate, reference in zip(rewritten(*args), repeated_activation(*args)):
+            self.assertTrue(torch.equal(candidate, reference))
+
+    def test_packed_override_rejects_unsupported_layouts(self):
+        """Blocked lanes, batched projections, and offsets are safe non-matches."""
+        x, w13, _, _ = make_packed_inputs()
+
+        def blocked_lanes(x, blocked_weight):
+            gate, up = torch.einsum("bsd,ghd->bsgh", x, blocked_weight).unbind(-2)
+            return silu_and_mul_op(gate.reshape(B * S, H), up.reshape(B * S, H))
+
+        blocked_weight = w13.permute(1, 0, 2).contiguous()
+        self.assertEqual(
+            flex_gemm_nodes(self._rewrite(blocked_lanes, x, blocked_weight)), []
+        )
+
+        def batched_projection(x, w13):
+            weight = w13.permute(2, 0, 1).reshape(D, 2 * H)
+            packed = torch.bmm(x, weight.expand(B, -1, -1))
+            lanes = packed.view(B, S, H, 2)
+            return silu_and_mul_op(
+                lanes.select(-1, 0).reshape(B * S, H),
+                lanes.select(-1, 1).reshape(B * S, H),
+            )
+
+        self.assertEqual(flex_gemm_nodes(self._rewrite(batched_projection, x, w13)), [])
+
+        def with_offsets(x, w13, offsets):
+            gate, up = torch.einsum("bsd,hgd->bshg", x, w13).unbind(-1)
+            return silu_and_mul_op(
+                gate.reshape(B * S, H), up.reshape(B * S, H), offsets
+            )
+
+        offsets = torch.tensor([0, B * S], device="cuda", dtype=torch.int32)
+        self.assertEqual(
+            flex_gemm_nodes(self._rewrite(with_offsets, x, w13, offsets)), []
         )
 
     def test_body_graph_is_the_matched_subgraph(self):
@@ -682,6 +841,30 @@ class TestFlexGemmCompiled(TestCase):
         self.assertTrue(
             torch.equal(actual[1][~valid], torch.zeros_like(actual[1][~valid]))
         )
+
+    def test_compiled_packed_swiglu_selects_quack(self):
+        """Packed override lowering contracts main and saves physical lanes."""
+        args = make_packed_inputs()
+        control = full_inductor_compilation_pass(
+            traced(packed_swiglu_train_step, *args),
+            args,
+        )
+        rewritten = traced(packed_swiglu_train_step, *args)
+        rewritten = flex_gemm_swiglu_pass(rewritten, fake_inputs(rewritten))
+        rewritten.graph.eliminate_dead_code()
+        rewritten.recompile()
+        rewritten, sources = run_and_get_code(
+            full_inductor_compilation_pass, rewritten, fake_inputs(rewritten)
+        )
+        code = "\n".join(sources)
+        self.assertIn("flex_gemm_runtime(", code)
+        self.assertIn("tuned=True", code)
+        self.assertIn("cvt.rn.bf16.f32", code)
+        self.assertIn("FlexGemmGroupedMainOutputTransform(group=2", code)
+        self.assertIn("aux_outs=", code)
+
+        for candidate, reference in zip(rewritten(*args), control(*args)):
+            self.assertTrue(torch.equal(candidate, reference))
 
     def test_compiled_selects_quack_and_matches_reference(self):
         """The compiled rewrite runs QUACK FlexGEMM and stays as accurate as eager."""

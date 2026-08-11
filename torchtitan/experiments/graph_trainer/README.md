@@ -42,6 +42,46 @@ MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh
 MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_16b ./run_train.sh
 ```
 
+#### Comparing Qwen3-0.6B with FlexGEMM on one B200
+
+The FlexGEMM configuration enables the tuned QUACK forward SwiGLU and chunked
+LM-head cross-entropy rewrites. The baseline uses the same model and full-train
+GraphTrainer compilation without FlexGEMM rewrites.
+
+```bash
+# Baseline
+MODULE=graph_trainer.qwen3 CONFIG=graph_trainer_qwen3_0_6b ./run_train.sh \
+  --compile.inductor_compilation full
+
+# FlexGEMM
+MODULE=graph_trainer.qwen3 CONFIG=graph_trainer_qwen3_0_6b_flex_gemm ./run_train.sh \
+  --compile.inductor_compilation full
+```
+
+#### Comparing optimized Qwen3-8B graph rewrites on one B200
+
+All configurations use TorchTitan's fused gate/up SwiGLU override. The optimized
+configuration orients the packed W13 weight-gradient GEMMs so they directly
+return contiguous parameter-layout gradients. This removes one large gradient
+materialization copy per transformer layer without changing loss or grad norm.
+The FlexGEMM configuration remains available for evaluating the tuned packed
+forward SwiGLU and chunked LM-head cross-entropy rewrites, but it is not the
+recommended throughput configuration for this exact workload.
+
+```bash
+# Fused TorchTitan baseline
+MODULE=graph_trainer.qwen3 CONFIG=graph_trainer_qwen3_8b_fused_swiglu ./run_train.sh \
+  --compile.inductor_compilation full
+
+# Fastest validated configuration
+MODULE=graph_trainer.qwen3 CONFIG=graph_trainer_qwen3_8b_optimized ./run_train.sh \
+  --compile.inductor_compilation full
+
+# FlexGEMM kernel experiment
+MODULE=graph_trainer.qwen3 CONFIG=graph_trainer_qwen3_8b_flex_gemm ./run_train.sh \
+  --compile.inductor_compilation full
+```
+
 #### Training Qwen3-14B
 
 ```bash
