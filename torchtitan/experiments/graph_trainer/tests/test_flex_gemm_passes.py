@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Unit tests for the FlexGEMM dense-SwiGLU graph pass.
+"""Unit tests for the dense-Qwen3 FlexGEMM graph passes.
 
 The positive cases build a train-step graph shaped like the one
 ``minimal_fx_tracer`` + ``selective_activation_remat_pass`` produce for a dense
@@ -24,8 +24,10 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 from torchtitan.experiments.graph_trainer.flex_gemm_passes import (
+    flex_gemm_cross_entropy_pass,
     flex_gemm_residual_pass,
     flex_gemm_swiglu_pass,
+    QUACK_CROSS_ENTROPY_KERNEL_OPTIONS,
     QUACK_KERNEL_OPTIONS,
     QUACK_SWIGLU_KERNEL_OPTIONS,
 )
@@ -35,6 +37,7 @@ from torchtitan.experiments.graph_trainer.inductor_passes import (
 from torchtitan.tools.utils import has_cuda_capability
 
 B, S, D, H = 2, 256, 512, 1024
+CE_M, CE_K, CE_N = 32, 64, 256
 FLEX_GEMM = torch.ops.higher_order.flex_gemm
 
 
@@ -63,25 +66,59 @@ def residual_step(x, weight, residual):
     return out + residual
 
 
+def cross_entropy_joint_step(x, weight, targets, grad_scale):
+    """Chunked LM-head CE with the explicit backward shape from AOTAutograd."""
+    logits = torch.ops.aten.mm.default(x, weight)
+    log_probs = torch.ops.aten._log_softmax.default(logits.float(), 1, False)
+    saved_log_probs = torch.ops.aten.alias.default(
+        torch.ops.aten.alias.default(log_probs)
+    )
+    loss, total_weight = torch.ops.aten.nll_loss_forward.default(
+        log_probs, targets, None, 2, -100
+    )
+    nll_grad = torch.ops.aten.nll_loss_backward.default(
+        grad_scale, log_probs, targets, None, 2, -100, total_weight
+    )
+    logits_grad = torch.ops.aten._log_softmax_backward_data.default(
+        nll_grad, saved_log_probs, 1, torch.float32
+    )
+    return loss, logits_grad.to(torch.bfloat16)
+
+
 def make_inputs(dtype=torch.bfloat16, device="cuda"):
     generator = torch.Generator(device=device).manual_seed(42)
 
     def normal(*shape):
         # Keep magnitudes near unit scale so BFloat16 rounding stays informative.
-        return torch.randn(
-            *shape, generator=generator, device=device, dtype=dtype
-        ) / (D**0.5)
+        return torch.randn(*shape, generator=generator, device=device, dtype=dtype) / (
+            D**0.5
+        )
 
     return (normal(B, S, D), normal(H, D), normal(H, D), normal(D, H), normal(B, S, D))
+
+
+def make_cross_entropy_inputs(device="cuda", grad_scale=1 / 2048):
+    generator = torch.Generator(device=device).manual_seed(42)
+    x = torch.randn(
+        CE_M, CE_K, generator=generator, device=device, dtype=torch.bfloat16
+    )
+    weight = torch.randn(
+        CE_K, CE_N, generator=generator, device=device, dtype=torch.bfloat16
+    )
+    targets = torch.randint(
+        CE_N, (CE_M,), generator=generator, device=device, dtype=torch.int64
+    )
+    targets[::7] = -100
+    return x, weight, targets, torch.tensor(grad_scale, device=device)
 
 
 def make_residual_inputs(dtype=torch.bfloat16, device="cuda"):
     generator = torch.Generator(device=device).manual_seed(42)
 
     def normal(*shape):
-        return torch.randn(
-            *shape, generator=generator, device=device, dtype=dtype
-        ) / (D**0.5)
+        return torch.randn(*shape, generator=generator, device=device, dtype=dtype) / (
+            D**0.5
+        )
 
     return normal(B, S, D), normal(D, D), normal(B, S, D)
 
@@ -224,9 +261,7 @@ class TestFlexGemmSwiGluPass(TestCase):
         self.assertEqual(main.meta["val"].shape, (B * S, H))
         reshaped = next(iter(main.users))
         self.assertEqual(reshaped.meta["val"].shape, mul_val.shape)
-        self.assertEqual(
-            reshaped.meta["custom"]["module_fqn"], "layers.0.feed_forward"
-        )
+        self.assertEqual(reshaped.meta["custom"]["module_fqn"], "layers.0.feed_forward")
         self.assertIsNot(fused.meta["custom"], gate_mm.meta.get("custom"))
 
     def test_fuses_qwen3_output_gemm_with_residual(self):
@@ -244,12 +279,8 @@ class TestFlexGemmSwiGluPass(TestCase):
                     fused[0].args[-1],
                     QUACK_KERNEL_OPTIONS,
                 )
-                self.assertEqual(
-                    count_target(rewritten, torch.ops.aten.mm.default), 0
-                )
-                self.assertEqual(
-                    count_target(rewritten, torch.ops.aten.add.Tensor), 0
-                )
+                self.assertEqual(count_target(rewritten, torch.ops.aten.mm.default), 0)
+                self.assertEqual(count_target(rewritten, torch.ops.aten.add.Tensor), 0)
                 body = getattr(rewritten, fused[0].args[1].target)
                 targets = [
                     node.target
@@ -260,9 +291,31 @@ class TestFlexGemmSwiGluPass(TestCase):
                     targets,
                     [torch.ops.aten.mm.default, torch.ops.aten.add.Tensor],
                 )
-                self.assertTrue(
-                    torch.equal(rewritten(*args), residual_step(*args))
-                )
+                self.assertTrue(torch.equal(rewritten(*args), residual_step(*args)))
+
+    def test_residual_rewrite_handles_chained_residuals(self):
+        """Downstream-first rewriting preserves residual dependencies."""
+
+        def chained(x, weight1, weight2, residual):
+            first = torch.mm(x.reshape(B * S, D), weight1.t()).reshape(B, S, D)
+            hidden = first + residual
+            second = torch.mm(hidden.reshape(B * S, D), weight2.t()).reshape(B, S, D)
+            return hidden + second
+
+        x, weight1, residual = make_residual_inputs()
+        weight2 = weight1.clone()
+        args = x, weight1, weight2, residual
+        gm = traced(chained, *args)
+        for output_mm in gm.graph.find_nodes(
+            op="call_function", target=torch.ops.aten.mm.default
+        ):
+            output_mm.meta.setdefault("custom", {})[
+                "module_fqn"
+            ] = "layers.0.feed_forward.w2"
+        expected = chained(*args)
+        gm = flex_gemm_residual_pass(gm, fake_inputs(gm))
+        self.assertEqual(len(flex_gemm_nodes(gm)), 2)
+        self.assertTrue(torch.equal(gm(*args), expected))
 
     def test_residual_rewrite_requires_qwen3_output_fqn(self):
         """Do not turn arbitrary GEMM-plus-add graphs into FlexGEMM calls."""
@@ -272,8 +325,8 @@ class TestFlexGemmSwiGluPass(TestCase):
         )
         self.assertEqual(flex_gemm_nodes(rewritten), [])
 
-    def test_residual_rewrite_rejects_shared_gemm_output(self):
-        """The residual rewrite cannot erase a GEMM with another reader."""
+    def test_residual_rewrite_preserves_later_gemm_reader(self):
+        """A later backward-style reader consumes the FlexGEMM auxiliary."""
 
         def shared_output(x, weight, residual):
             out = torch.mm(x.reshape(B * S, D), weight.t())
@@ -288,9 +341,62 @@ class TestFlexGemmSwiGluPass(TestCase):
                 )
             )
         )
-        output_mm.meta.setdefault("custom", {})["module_fqn"] = (
-            "layers.0.feed_forward.w2"
+        output_mm.meta.setdefault("custom", {})[
+            "module_fqn"
+        ] = "layers.0.feed_forward.w2"
+        expected = shared_output(*args)
+        gm = flex_gemm_residual_pass(gm, fake_inputs(gm))
+        fused = flex_gemm_nodes(gm)
+        self.assertEqual(len(fused), 1)
+        self.assertEqual(
+            sorted(user.args[1] for user in fused[0].users),
+            [0, 1],
         )
+        for actual, reference in zip(gm(*args), expected):
+            self.assertTrue(torch.equal(actual, reference))
+
+    def test_residual_rewrite_rejects_early_gemm_reader(self):
+        """A reader before the residual add cannot consume a later auxiliary."""
+
+        def early_reader(x, weight, residual):
+            out = torch.mm(x.reshape(B * S, D), weight.t())
+            before_add = out + 1.0
+            return out.reshape(B, S, D) + residual, before_add
+
+        args = make_residual_inputs()
+        gm = traced(early_reader, *args)
+        output_mm = next(
+            iter(
+                gm.graph.find_nodes(
+                    op="call_function", target=torch.ops.aten.mm.default
+                )
+            )
+        )
+        output_mm.meta.setdefault("custom", {})[
+            "module_fqn"
+        ] = "layers.0.feed_forward.w2"
+        gm = flex_gemm_residual_pass(gm, fake_inputs(gm))
+        self.assertEqual(flex_gemm_nodes(gm), [])
+
+    def test_residual_rewrite_rejects_gemm_as_its_own_residual(self):
+        """Do not create a cyclic FlexGEMM capture for ``add(mm, mm)``."""
+
+        def self_residual(x, weight):
+            out = torch.mm(x.reshape(B * S, D), weight.t())
+            return out + out
+
+        x, weight, _ = make_residual_inputs()
+        gm = traced(self_residual, x, weight)
+        output_mm = next(
+            iter(
+                gm.graph.find_nodes(
+                    op="call_function", target=torch.ops.aten.mm.default
+                )
+            )
+        )
+        output_mm.meta.setdefault("custom", {})[
+            "module_fqn"
+        ] = "layers.0.feed_forward.w2"
         gm = flex_gemm_residual_pass(gm, fake_inputs(gm))
         self.assertEqual(flex_gemm_nodes(gm), [])
 
@@ -379,9 +485,118 @@ class TestFlexGemmSwiGluPass(TestCase):
     def test_no_match_on_cpu(self):
         """The QUACK backend is CUDA-only, so CPU sites are left alone."""
         args = make_inputs(device="cpu", dtype=torch.float32)
-        self.assertEqual(
-            flex_gemm_nodes(self._rewrite(swiglu_train_step, *args)), []
+        self.assertEqual(flex_gemm_nodes(self._rewrite(swiglu_train_step, *args)), [])
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+class TestFlexGemmCrossEntropyPass(TestCase):
+    def _rewrite(self, *args):
+        gm = traced(cross_entropy_joint_step, *args)
+        logits_mm = next(
+            iter(
+                gm.graph.find_nodes(
+                    op="call_function", target=torch.ops.aten.mm.default
+                )
+            )
         )
+        logits_mm.meta.setdefault("custom", {})["module_fqn"] = "lm_head"
+        return flex_gemm_cross_entropy_pass(gm, fake_inputs(gm))
+
+    def test_fuses_joint_cross_entropy_forward_and_backward(self):
+        """The LM-head GEMM owns indexed CE statistics and explicit backward."""
+        rewritten = self._rewrite(*make_cross_entropy_inputs())
+        fused = flex_gemm_nodes(rewritten)
+        self.assertEqual(len(fused), 1)
+        self.assertEqual(fused[0].args[-1], QUACK_CROSS_ENTROPY_KERNEL_OPTIONS)
+        self.assertEqual(len(fused[0].args[2]), 3)
+        self.assertEqual(count_target(rewritten, torch.ops.aten.mm.default), 0)
+        self.assertEqual(
+            count_target(rewritten, torch.ops.aten._log_softmax.default), 0
+        )
+        self.assertEqual(
+            count_target(rewritten, torch.ops.aten.nll_loss_forward.default), 0
+        )
+        self.assertEqual(
+            count_target(rewritten, torch.ops.aten.nll_loss_backward.default), 0
+        )
+        self.assertEqual(
+            count_target(rewritten, torch.ops.aten._log_softmax_backward_data.default),
+            0,
+        )
+
+        body = getattr(rewritten, fused[0].args[1].target)
+        output = next(iter(body.graph.find_nodes(op="output"))).args[0]
+        self.assertEqual(len(output), 3)
+        self.assertEqual(output[2].meta["val"].shape, (CE_M, CE_N // 64))
+
+    def test_interpreted_rewrite_matches_original_graph(self):
+        """The functional HOP path preserves sum CE and its explicit gradient."""
+        args = make_cross_entropy_inputs(grad_scale=1.0)
+        reference = cross_entropy_joint_step(*args)
+        actual = self._rewrite(*args)(*args)
+        torch.testing.assert_close(actual[0], reference[0], atol=0, rtol=0)
+        torch.testing.assert_close(actual[1], reference[1], atol=1e-8, rtol=0)
+
+    def test_all_ignored_targets_produce_zero_loss_and_gradient(self):
+        """Safe gather indices must not leak ignored rows into CE outputs."""
+        args = list(make_cross_entropy_inputs(grad_scale=1.0))
+        args[2].fill_(-100)
+        loss, grad = self._rewrite(*args)(*args)
+        self.assertEqual(loss.item(), 0.0)
+        self.assertTrue(torch.equal(grad, torch.zeros_like(grad)))
+
+    def test_accepts_real_qwen_output_cast_kwargs(self):
+        """Same-device layout kwargs remain a dtype-only output conversion."""
+        args = make_cross_entropy_inputs()
+        gm = traced(cross_entropy_joint_step, *args)
+        logits_mm = next(
+            iter(
+                gm.graph.find_nodes(
+                    op="call_function", target=torch.ops.aten.mm.default
+                )
+            )
+        )
+        logits_mm.meta.setdefault("custom", {})["module_fqn"] = "lm_head"
+        grad_cast = list(
+            gm.graph.find_nodes(
+                op="call_function", target=torch.ops.aten._to_copy.default
+            )
+        )[-1]
+        grad_cast.kwargs = {
+            "dtype": torch.bfloat16,
+            "layout": torch.strided,
+            "device": torch.device("cuda", 0),
+        }
+        gm = flex_gemm_cross_entropy_pass(gm, fake_inputs(gm))
+        self.assertEqual(len(flex_gemm_nodes(gm)), 1)
+
+    def test_missing_target_metadata_skips_rewrite(self):
+        """Incomplete fake metadata is an unsupported near miss, not a crash."""
+        args = make_cross_entropy_inputs()
+        gm = traced(cross_entropy_joint_step, *args)
+        logits_mm = next(
+            iter(
+                gm.graph.find_nodes(
+                    op="call_function", target=torch.ops.aten.mm.default
+                )
+            )
+        )
+        logits_mm.meta.setdefault("custom", {})["module_fqn"] = "lm_head"
+        targets = next(
+            node
+            for node in gm.graph.find_nodes(op="placeholder")
+            if node.meta["val"].dtype is torch.int64
+        )
+        del targets.meta["val"]
+        gm = flex_gemm_cross_entropy_pass(gm, ())
+        self.assertEqual(flex_gemm_nodes(gm), [])
+
+    def test_requires_lm_head_annotation(self):
+        """Do not rewrite an arbitrary GEMM followed by cross entropy."""
+        args = make_cross_entropy_inputs()
+        gm = traced(cross_entropy_joint_step, *args)
+        gm = flex_gemm_cross_entropy_pass(gm, fake_inputs(gm))
+        self.assertEqual(flex_gemm_nodes(gm), [])
 
 
 _VIEW_OR_SILU = (
@@ -395,7 +610,79 @@ _VIEW_OR_SILU = (
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
 @unittest.skipIf(not has_cuda_capability(10, 0), "FlexGEMM QUACK requires SM100+")
-class TestFlexGemmSwiGluCompiled(TestCase):
+class TestFlexGemmCompiled(TestCase):
+    def test_compiled_residual_auxiliary_is_consumed(self):
+        """Compiled QUACK returns a saved GEMM value for later readers."""
+
+        def shared_output(x, weight, residual):
+            out = torch.mm(x.reshape(B * S, D), weight.t())
+            return out.reshape(B, S, D) + residual, out
+
+        args = make_residual_inputs()
+        rewritten = traced(shared_output, *args)
+        output_mm = next(
+            iter(
+                rewritten.graph.find_nodes(
+                    op="call_function", target=torch.ops.aten.mm.default
+                )
+            )
+        )
+        output_mm.meta.setdefault("custom", {})[
+            "module_fqn"
+        ] = "layers.0.feed_forward.w2"
+        rewritten = flex_gemm_residual_pass(rewritten, fake_inputs(rewritten))
+        rewritten, sources = run_and_get_code(
+            full_inductor_compilation_pass, rewritten, fake_inputs(rewritten)
+        )
+        code = "\n".join(sources)
+        self.assertIn("flex_gemm_runtime(", code)
+        self.assertIn("tuned=True", code)
+        self.assertIn("aux_outs=", code)
+        actual_main, actual_saved = rewritten(*args)
+        reference_main, reference_saved = shared_output(*args)
+        torch.testing.assert_close(actual_main, reference_main, atol=0.002, rtol=0.02)
+        self.assertTrue(torch.equal(actual_saved, reference_saved))
+
+    def test_compiled_cross_entropy_selects_tuned_quack(self):
+        """Compiled CE uses coherent rounded logits for loss and backward."""
+        args = make_cross_entropy_inputs(grad_scale=1.0)
+        control = traced(cross_entropy_joint_step, *args)
+        control = full_inductor_compilation_pass(control, fake_inputs(control))
+        expected = control(*args)
+
+        rewritten = traced(cross_entropy_joint_step, *args)
+        logits_mm = next(
+            iter(
+                rewritten.graph.find_nodes(
+                    op="call_function", target=torch.ops.aten.mm.default
+                )
+            )
+        )
+        logits_mm.meta.setdefault("custom", {})["module_fqn"] = "lm_head"
+        rewritten = flex_gemm_cross_entropy_pass(rewritten, fake_inputs(rewritten))
+        rewritten, sources = run_and_get_code(
+            full_inductor_compilation_pass, rewritten, fake_inputs(rewritten)
+        )
+        code = "\n".join(sources)
+        self.assertIn("flex_gemm_runtime(", code)
+        self.assertIn("tuned=True", code)
+        self.assertIn("FlexGemmEpiModIndexedOutputPlan", code)
+        self.assertIn("reduce_planes=2", code)
+        self.assertIn("cvt.rn.bf16.f32", code)
+        self.assertIn("fast_math: True", code)
+
+        actual = rewritten(*args)
+        torch.testing.assert_close(actual[0], expected[0], atol=2e-4, rtol=2e-5)
+        torch.testing.assert_close(actual[1], expected[1], atol=0.015, rtol=0.05)
+
+        valid = args[2] != -100
+        actual_row_sum = actual[1][valid].float().sum(-1).abs().max()
+        expected_row_sum = expected[1][valid].float().sum(-1).abs().max()
+        self.assertLessEqual(actual_row_sum.item(), expected_row_sum.item() + 0.002)
+        self.assertTrue(
+            torch.equal(actual[1][~valid], torch.zeros_like(actual[1][~valid]))
+        )
+
     def test_compiled_selects_quack_and_matches_reference(self):
         """The compiled rewrite runs QUACK FlexGEMM and stays as accurate as eager."""
         args = make_inputs()

@@ -6,8 +6,8 @@
 
 """Qwen3 FlexGEMM rewrites for the full train-step graph.
 
-The passes cover the dense SwiGLU forward epilogue and independently fuse
-eligible attention/FFN output GEMMs with their residual adds.
+The passes cover dense SwiGLU forward, attention/FFN output residual adds,
+and chunked LM-head cross entropy with its explicit backward.
 
 ``aot_fx_trace`` captures forward + loss + backward in one FX graph, so the
 backward of the SwiGLU block is already explicit aten code. That lets a plain
@@ -24,12 +24,18 @@ saved gate value (``silu_backward``) and the saved up value. Returning the gate
 as an auxiliary is what keeps the rewrite work-neutral: without it the standalone
 gate GEMM would have to stay live for the backward, leaving two gate GEMMs.
 
-Numerics: FlexGEMM evaluates the epilogue on the Float32 GEMM accumulator and
-uses its fast-math tanh identity for SiLU, while the matched graph applies the
-standard ``silu``/``mul`` to the rounded BFloat16 gate value. The fused output is
-therefore not bitwise equal to the graph it replaces. The auxiliary gate output
-keeps the original ``[M, N]`` rounding, so the traced backward still reads the
-same kind of value it read before. The pass is opt-in for that reason.
+The cross-entropy pass similarly moves target-logit gather and group-64 online
+logsumexp onto each LM-head GEMM. A small final reduction computes the summed
+loss, while a pointwise expression replaces NLL and log-softmax backward. This
+removes the full Float32 log-probability tensor from the joint graph.
+
+Numerics: FlexGEMM evaluates epilogues on the Float32 GEMM accumulator. SwiGLU
+also uses its fast-math tanh identity, while the original graph applies SiLU to
+the rounded BFloat16 gate. Cross entropy explicitly rounds the accumulator to
+BFloat16 before its target gather, LSE, and backward so all three use one
+coherent logits value. Its grouped LSE uses fast math and can still differ
+slightly from the original reduction order. All three passes are opt-in for
+that reason.
 
 NOTE [FlexGEMM kernels and compile-time autotuning]
 ``standalone_compile``, which backs both regional and full Inductor compilation,
@@ -55,6 +61,7 @@ from torch._higher_order_ops.flex_gemm import (
     flex_gemm_hop,
     mark_flex_gemm_body_gemm_node,
 )
+from torch._higher_order_ops.inline_asm_elementwise import inline_asm_elementwise
 from torch._inductor.codegen.wrapper import PythonWrapperCodegen
 from torch.fx.experimental.proxy_tensor import make_fx
 
@@ -62,6 +69,10 @@ from torchtitan.tools.logging import logger
 
 QUACK_KERNEL_OPTIONS = {"backend": "QUACK", "tuned": True}
 QUACK_SWIGLU_KERNEL_OPTIONS = {**QUACK_KERNEL_OPTIONS, "fast_math": True}
+QUACK_CROSS_ENTROPY_KERNEL_OPTIONS = {**QUACK_KERNEL_OPTIONS, "fast_math": True}
+
+_CROSS_ENTROPY_GROUP = 64
+_IGNORE_INDEX = -100
 
 _CUTEDSL_KERNEL_PREFIX = "cutedsl_"
 
@@ -118,6 +129,19 @@ class ResidualSite:
     output_mm: torch.fx.Node
     output_views: tuple[torch.fx.Node, ...]
     residual: torch.fx.Node
+    preserve_output: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CrossEntropySite:
+    """One chunked LM-head GEMM and its explicit CE forward/backward."""
+
+    logits_mm: torch.fx.Node
+    log_softmax: torch.fx.Node
+    loss: torch.fx.Node
+    targets: torch.fx.Node
+    grad_scale: torch.fx.Node
+    grad_to_bf16: torch.fx.Node
 
 
 _RESIDUAL_GEMM_FQN_SUFFIXES = (".attention.wo", ".feed_forward.w2")
@@ -138,6 +162,61 @@ def _static_shape(val: torch.Tensor) -> tuple[int, ...] | None:
 
 def _has_single_user(node: torch.fx.Node, user: torch.fx.Node) -> bool:
     return len(node.users) == 1 and next(iter(node.users)) is user
+
+
+def _depends_on(node: torch.fx.Node, ancestor: torch.fx.Node) -> bool:
+    """Return whether ``node`` transitively reads ``ancestor``."""
+    pending = list(node.all_input_nodes)
+    visited: set[torch.fx.Node] = set()
+    while pending:
+        producer = pending.pop()
+        if producer is ancestor:
+            return True
+        if producer not in visited:
+            visited.add(producer)
+            pending.extend(producer.all_input_nodes)
+    return False
+
+
+def _is_exact_dtype_cast(node: torch.fx.Node, dtype: torch.dtype) -> bool:
+    """Recognize an ``_to_copy`` that changes only dtype."""
+    if (
+        node.target is not torch.ops.aten._to_copy.default
+        or len(node.args) != 1
+        or set(node.kwargs) - {"dtype", "layout", "device"}
+        or node.kwargs.get("dtype") is not dtype
+        or not isinstance(node.args[0], torch.fx.Node)
+    ):
+        return False
+    source_val = _fake_val(node.args[0])
+    output_val = _fake_val(node)
+    return (
+        source_val is not None
+        and output_val is not None
+        and node.kwargs.get("layout", source_val.layout) is source_val.layout
+        and node.kwargs.get("device", source_val.device) == source_val.device
+        and output_val.dtype is dtype
+        and output_val.device == source_val.device
+        and output_val.layout is source_val.layout
+        and output_val.shape == source_val.shape
+        and output_val.stride() == source_val.stride()
+    )
+
+
+def _unique_user(node: torch.fx.Node, target) -> torch.fx.Node | None:
+    """Return the unique user with ``target``, or ``None``."""
+    matches = [user for user in node.users if user.target is target]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _getitem_user(node: torch.fx.Node, index: int) -> torch.fx.Node | None:
+    """Return the unique ``operator.getitem(node, index)`` user."""
+    matches = [
+        user
+        for user in node.users
+        if user.target is operator.getitem and user.args == (node, index)
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _gate_gemm_chain(
@@ -189,9 +268,11 @@ def _module_fqn(node: torch.fx.Node) -> str:
 
 
 def _output_gemm_chain(
-    output: torch.fx.Node, add: torch.fx.Node
-) -> tuple[torch.fx.Node, tuple[torch.fx.Node, ...]] | None:
-    """Walk a single-use view chain from an add input to its output GEMM."""
+    output: torch.fx.Node,
+    add: torch.fx.Node,
+    node_order: dict[torch.fx.Node, int],
+) -> tuple[torch.fx.Node, tuple[torch.fx.Node, ...], bool] | None:
+    """Walk the forward view chain and classify later GEMM readers."""
     views: tuple[torch.fx.Node, ...] = ()
     consumer = add
     node = output
@@ -204,14 +285,17 @@ def _output_gemm_chain(
         if not isinstance(producer, torch.fx.Node):
             return None
         node = producer
-    if node.target is not torch.ops.aten.mm.default:
+    if node.target is not torch.ops.aten.mm.default or consumer not in node.users:
         return None
-    if not _has_single_user(node, consumer):
+    surviving_users = [user for user in node.users if user is not consumer]
+    if any(node_order[user] < node_order[add] for user in surviving_users):
         return None
-    return node, views
+    return node, views, bool(surviving_users)
 
 
-def match_residual_site(add: torch.fx.Node) -> ResidualSite | None:
+def match_residual_site(
+    add: torch.fx.Node, node_order: dict[torch.fx.Node, int]
+) -> ResidualSite | None:
     """Match a Qwen3 attention/FFN output GEMM followed by a residual add."""
     if add.target is not torch.ops.aten.add.Tensor or len(add.args) != 2:
         return None
@@ -223,11 +307,15 @@ def match_residual_site(add: torch.fx.Node) -> ResidualSite | None:
             residual, torch.fx.Node
         ):
             continue
-        chain = _output_gemm_chain(output, add)
+        chain = _output_gemm_chain(output, add, node_order)
         if chain is None:
             continue
-        output_mm, output_views = chain
-        if not _module_fqn(output_mm).endswith(_RESIDUAL_GEMM_FQN_SUFFIXES):
+        output_mm, output_views, preserve_output = chain
+        if (
+            not _module_fqn(output_mm).endswith(_RESIDUAL_GEMM_FQN_SUFFIXES)
+            or residual is output_mm
+            or _depends_on(residual, output_mm)
+        ):
             continue
 
         gemm_val = _fake_val(output_mm)
@@ -252,8 +340,185 @@ def match_residual_site(add: torch.fx.Node) -> ResidualSite | None:
             output_mm=output_mm,
             output_views=output_views,
             residual=residual,
+            preserve_output=preserve_output,
         )
     return None
+
+
+def _lm_head_gemm(log_softmax: torch.fx.Node) -> torch.fx.Node | None:
+    """Follow the loss cast/view chain back to a single-use LM-head GEMM."""
+    logits_float = log_softmax.args[0]
+    if not isinstance(logits_float, torch.fx.Node) or not _is_exact_dtype_cast(
+        logits_float, torch.float32
+    ):
+        return None
+
+    consumer = logits_float
+    node = logits_float.args[0]
+    while isinstance(node, torch.fx.Node) and node.target in _VIEW_TARGETS:
+        if not _has_single_user(node, consumer):
+            return None
+        consumer = node
+        node = node.args[0]
+    if (
+        not isinstance(node, torch.fx.Node)
+        or node.target is not torch.ops.aten.mm.default
+        or not _has_single_user(node, consumer)
+        or _module_fqn(node) != "lm_head"
+    ):
+        return None
+    return node
+
+
+def _log_softmax_backward(
+    log_softmax: torch.fx.Node, nll_backward: torch.fx.Node
+) -> torch.fx.Node | None:
+    """Follow the saved-log-probability alias chain to its backward op."""
+    alias = _unique_user(log_softmax, torch.ops.aten.alias.default)
+    if alias is None:
+        return None
+    while True:
+        next_alias = _unique_user(alias, torch.ops.aten.alias.default)
+        if next_alias is None:
+            break
+        if len(alias.users) != 1:
+            return None
+        alias = next_alias
+    backward = _unique_user(alias, torch.ops.aten._log_softmax_backward_data.default)
+    if (
+        backward is None
+        or len(alias.users) != 1
+        or backward.args[:3] != (nll_backward, alias, 1)
+        or backward.args[3] is not torch.float32
+    ):
+        return None
+    return backward
+
+
+def match_cross_entropy_site(log_softmax: torch.fx.Node) -> CrossEntropySite | None:
+    """Match one sum-reduced chunked LM-head CE forward and backward."""
+    if (
+        log_softmax.target is not torch.ops.aten._log_softmax.default
+        or log_softmax.args[1:] != (1, False)
+    ):
+        return None
+    logits_mm = _lm_head_gemm(log_softmax)
+    if logits_mm is None:
+        return None
+
+    a_node, b_node = logits_mm.args
+    logits_float = log_softmax.args[0]
+    if not all(
+        isinstance(node, torch.fx.Node) for node in (a_node, b_node, logits_float)
+    ):
+        return None
+    a_val, b_val, logits_val, logits_float_val, log_softmax_val = (
+        _fake_val(node)
+        for node in (a_node, b_node, logits_mm, logits_float, log_softmax)
+    )
+    if any(
+        val is None
+        for val in (a_val, b_val, logits_val, logits_float_val, log_softmax_val)
+    ):
+        return None
+    a_shape, b_shape, logits_shape = (
+        _static_shape(val) for val in (a_val, b_val, logits_val)
+    )
+    if (
+        a_shape is None
+        or b_shape is None
+        or logits_shape is None
+        or len(a_shape) != 2
+        or len(b_shape) != 2
+        or logits_shape != (a_shape[0], b_shape[1])
+        or a_shape[1] != b_shape[0]
+        or logits_shape[1] % _CROSS_ENTROPY_GROUP
+        or any(val.device.type != "cuda" for val in (a_val, b_val, logits_val))
+        or len({a_val.device, b_val.device, logits_val.device}) != 1
+        or any(val.dtype is not torch.bfloat16 for val in (a_val, b_val, logits_val))
+        or logits_float_val.device != logits_val.device
+        or logits_float_val.dtype is not torch.float32
+        or _static_shape(logits_float_val) != logits_shape
+        or log_softmax_val.device != logits_val.device
+        or log_softmax_val.dtype is not torch.float32
+        or _static_shape(log_softmax_val) != logits_shape
+    ):
+        return None
+
+    nll_forward = _unique_user(log_softmax, torch.ops.aten.nll_loss_forward.default)
+    nll_backward = _unique_user(log_softmax, torch.ops.aten.nll_loss_backward.default)
+    if nll_forward is None or nll_backward is None:
+        return None
+    if nll_forward.args[0] is not log_softmax or nll_forward.args[2:] != (
+        None,
+        2,
+        _IGNORE_INDEX,
+    ):
+        return None
+    targets = nll_forward.args[1]
+    if not isinstance(targets, torch.fx.Node):
+        return None
+    targets_val = _fake_val(targets)
+    if (
+        targets_val is None
+        or targets_val.device != logits_val.device
+        or targets_val.dtype not in (torch.int32, torch.int64)
+        or _static_shape(targets_val) != (logits_shape[0],)
+        or tuple(targets_val.stride()) != (1,)
+    ):
+        return None
+    loss = _getitem_user(nll_forward, 0)
+    total_weight = _getitem_user(nll_forward, 1)
+    if (
+        loss is None
+        or total_weight is None
+        or set(nll_forward.users) != {loss, total_weight}
+        or set(total_weight.users) != {nll_backward}
+    ):
+        return None
+    if nll_backward.args[1:] != (
+        log_softmax,
+        targets,
+        None,
+        2,
+        _IGNORE_INDEX,
+        total_weight,
+    ) or not isinstance(nll_backward.args[0], torch.fx.Node):
+        return None
+
+    log_softmax_backward = _log_softmax_backward(log_softmax, nll_backward)
+    if (
+        log_softmax_backward is None
+        or set(nll_backward.users) != {log_softmax_backward}
+        or len(log_softmax.users) != 3
+    ):
+        return None
+    grad_to_bf16 = _unique_user(log_softmax_backward, torch.ops.aten._to_copy.default)
+    if grad_to_bf16 is None or not _is_exact_dtype_cast(grad_to_bf16, torch.bfloat16):
+        return None
+    grad_scale = nll_backward.args[0]
+    grad_scale_val = _fake_val(grad_scale)
+    grad_val = _fake_val(grad_to_bf16)
+    if (
+        not isinstance(grad_scale, torch.fx.Node)
+        or grad_scale_val is None
+        or grad_scale_val.device != logits_val.device
+        or grad_scale_val.dtype is not torch.float32
+        or _static_shape(grad_scale_val) != ()
+        or grad_val is None
+        or grad_val.device != logits_val.device
+        or grad_val.dtype is not torch.bfloat16
+        or _static_shape(grad_val) != logits_shape
+    ):
+        return None
+    return CrossEntropySite(
+        logits_mm=logits_mm,
+        log_softmax=log_softmax,
+        loss=loss,
+        targets=targets,
+        grad_scale=grad_scale,
+        grad_to_bf16=grad_to_bf16,
+    )
 
 
 def match_swiglu_site(
@@ -307,9 +572,7 @@ def match_swiglu_site(
         for user in gate_mm.users
     ):
         return None
-    return SwiGluSite(
-        mul=mul, silu=silu, gate_mm=gate_mm, gate_views=gate_views, up=up
-    )
+    return SwiGluSite(mul=mul, silu=silu, gate_mm=gate_mm, gate_views=gate_views, up=up)
 
 
 def _build_body_graph(
@@ -335,19 +598,126 @@ def _build_residual_body_graph(
     a_val: torch.Tensor,
     b_val: torch.Tensor,
     residual_val: torch.Tensor,
+    *,
+    preserve_output: bool,
 ) -> torch.fx.GraphModule:
-    """Trace the FlexGEMM body ``mm(a, b) + residual``."""
+    """Trace residual fusion, optionally returning the unfused GEMM value."""
 
     def body(a, b, residual):
-        out = torch.ops.aten.add.Tensor(
-            torch.ops.aten.mm.default(a, b), residual
-        )
-        return (out,)
+        gemm = torch.ops.aten.mm.default(a, b)
+        out = torch.ops.aten.add.Tensor(gemm, residual)
+        return (out, gemm) if preserve_output else (out,)
 
     with a_val.fake_mode:
         body_gm = make_fx(body)(a_val, b_val, residual_val)
     mark_flex_gemm_body_gemm_node(body_gm, torch.ops.aten.mm.default)
     return body_gm
+
+
+def _round_bfloat16_to_float(value: torch.Tensor) -> torch.Tensor:
+    """Round a Float32 accumulator through BFloat16 without an FX cast fold."""
+    return inline_asm_elementwise(
+        value,
+        asm_str="{ .reg .b16 h; cvt.rn.bf16.f32 h, $1; cvt.f32.bf16 $0, h; }",
+        constraints="=f,f",
+        dtype=torch.float32,
+    )
+
+
+def _build_cross_entropy_body_graph(
+    a_val: torch.Tensor,
+    b_val: torch.Tensor,
+    targets_val: torch.Tensor,
+) -> torch.fx.GraphModule:
+    """Trace LM-head GEMM outputs from one coherently rounded logits value."""
+    m, n = a_val.shape[0], b_val.shape[1]
+
+    def body(a, b, targets):
+        accumulator = torch.ops.aten.mm.default(a, b)
+        logits_float = _round_bfloat16_to_float(accumulator.float())
+        logits = logits_float.to(accumulator.dtype)
+        return (
+            logits,
+            logits.gather(1, targets[:, None]).squeeze(1),
+            logits_float.view(
+                m, n // _CROSS_ENTROPY_GROUP, _CROSS_ENTROPY_GROUP
+            ).logsumexp(-1),
+        )
+
+    with a_val.fake_mode:
+        body_gm = make_fx(body)(a_val, b_val, targets_val)
+    mark_flex_gemm_body_gemm_node(body_gm, torch.ops.aten.mm.default)
+    return body_gm
+
+
+def _trace_cross_entropy_targets(
+    targets_val: torch.Tensor,
+) -> torch.fx.GraphModule:
+    """Trace the ignore mask and valid gather indices."""
+
+    def preprocess(targets):
+        valid = targets != _IGNORE_INDEX
+        return valid, torch.where(valid, targets, 0)
+
+    with targets_val.fake_mode:
+        return make_fx(preprocess)(targets_val)
+
+
+def _trace_cross_entropy_loss(
+    target_logits_val: torch.Tensor,
+    partial_lse_val: torch.Tensor,
+    valid_val: torch.Tensor,
+) -> torch.fx.GraphModule:
+    """Trace the final LSE reduction and sum-reduced token loss."""
+
+    def finish(target_logits, partial_lse, valid):
+        lse = partial_lse.logsumexp(-1)
+        losses = torch.where(valid, lse - target_logits.float(), 0.0)
+        return losses.sum(), lse
+
+    with target_logits_val.fake_mode:
+        return make_fx(finish)(target_logits_val, partial_lse_val, valid_val)
+
+
+def _trace_cross_entropy_backward(
+    logits_val: torch.Tensor,
+    lse_val: torch.Tensor,
+    targets_val: torch.Tensor,
+    valid_val: torch.Tensor,
+    scale_val: torch.Tensor,
+) -> torch.fx.GraphModule:
+    """Trace ``(softmax - one_hot) * scale`` without materializing one-hot."""
+    n = logits_val.shape[1]
+
+    def backward(logits, lse, targets, valid, scale):
+        columns = torch.arange(n, device=logits.device, dtype=targets.dtype)
+        probabilities = torch.exp(logits.float() - lse[:, None])
+        target_columns = columns[None, :] == targets[:, None]
+        grad = torch.where(target_columns, probabilities - 1.0, probabilities)
+        return torch.where(valid[:, None], grad * scale, 0.0).to(logits.dtype)
+
+    with logits_val.fake_mode:
+        return make_fx(backward)(logits_val, lse_val, targets_val, valid_val, scale_val)
+
+
+def _inline_graph(
+    graph: torch.fx.Graph,
+    graph_module: torch.fx.GraphModule,
+    args: tuple[torch.fx.Node, ...],
+    before: torch.fx.Node,
+):
+    """Copy a traced tensor expression into ``graph`` before ``before``."""
+    placeholders = list(graph_module.graph.find_nodes(op="placeholder"))
+    if len(placeholders) != len(args):
+        raise AssertionError("inlined graph argument count must match placeholders")
+    with graph.inserting_before(before):
+        return graph.graph_copy(graph_module.graph, dict(zip(placeholders, args)))
+
+
+def _fake_outputs(graph_module: torch.fx.GraphModule):
+    """Return output metadata from a graph traced with fake tensors."""
+    output = next(iter(graph_module.graph.find_nodes(op="output")))
+    return torch.fx.node.map_arg(output.args[0], lambda node: node.meta["val"])
 
 
 def _inherit_meta(node: torch.fx.Node, source: torch.fx.Node, val) -> None:
@@ -417,10 +787,15 @@ def _fuse_residual_site(
     gemm_shape = tuple(site.output_mm.meta["val"].shape)
     with a_val.fake_mode:
         residual_2d_val = residual_val.reshape(gemm_shape)
-    body_gm = _build_residual_body_graph(a_val, b_val, residual_2d_val)
+    body_gm = _build_residual_body_graph(
+        a_val,
+        b_val,
+        residual_2d_val,
+        preserve_output=site.preserve_output,
+    )
     gm.register_module(body_name, body_gm)
-    with a_val.fake_mode:
-        (main_val,) = body_gm(a_val, b_val, residual_2d_val)
+    body_vals = _fake_outputs(body_gm)
+    main_val = body_vals[0]
     add_val = site.add.meta["val"]
 
     with graph.inserting_before(site.add):
@@ -443,21 +818,131 @@ def _fuse_residual_site(
             ),
         )
         main = graph.call_function(operator.getitem, (fused, 0))
+        preserved = (
+            graph.call_function(operator.getitem, (fused, 1))
+            if site.preserve_output
+            else None
+        )
         out = main
         if tuple(add_val.shape) != tuple(main_val.shape):
             out = graph.call_function(
                 torch.ops.aten.reshape.default, (main, list(add_val.shape))
             )
 
-    _inherit_meta(fused, site.add, (main_val,))
+    _inherit_meta(fused, site.add, body_vals)
     _inherit_meta(main, site.add, main_val)
+    if preserved is not None:
+        _inherit_meta(preserved, site.output_mm, body_vals[1])
     if out is not main:
         _inherit_meta(out, site.add, add_val)
     site.add.replace_all_uses_with(out)
     graph.erase_node(site.add)
     for view in site.output_views:
         graph.erase_node(view)
+    if preserved is not None:
+        site.output_mm.replace_all_uses_with(preserved)
     graph.erase_node(site.output_mm)
+
+
+def _fuse_cross_entropy_site(
+    gm: torch.fx.GraphModule,
+    site: CrossEntropySite,
+    body_name: str,
+) -> None:
+    """Replace one joint LM-head CE forward/backward with FlexGEMM."""
+    graph = gm.graph
+    a_node, b_node = site.logits_mm.args
+    a_val, b_val = (_fake_val(node) for node in (a_node, b_node))
+    targets_val = _fake_val(site.targets)
+    scale_val = _fake_val(site.grad_scale)
+
+    target_gm = _trace_cross_entropy_targets(targets_val)
+    valid, safe_targets = _inline_graph(
+        graph, target_gm, (site.targets,), site.log_softmax
+    )
+    valid_val, safe_targets_val = _fake_outputs(target_gm)
+
+    body_gm = _build_cross_entropy_body_graph(a_val, b_val, safe_targets_val)
+    gm.register_module(body_name, body_gm)
+    logits_val, target_logits_val, partial_lse_val = _fake_outputs(body_gm)
+    with graph.inserting_before(site.log_softmax):
+        body_attr = graph.get_attr(body_name)
+        fused = graph.call_function(
+            flex_gemm_hop,
+            (
+                torch.ops.aten.mm.default,
+                body_attr,
+                (a_node, b_node, safe_targets),
+                {},
+                dict(QUACK_CROSS_ENTROPY_KERNEL_OPTIONS),
+            ),
+        )
+        logits = graph.call_function(operator.getitem, (fused, 0))
+        target_logits = graph.call_function(operator.getitem, (fused, 1))
+        partial_lse = graph.call_function(operator.getitem, (fused, 2))
+
+    _inherit_meta(
+        fused, site.logits_mm, (logits_val, target_logits_val, partial_lse_val)
+    )
+    _inherit_meta(logits, site.logits_mm, logits_val)
+    _inherit_meta(target_logits, site.loss, target_logits_val)
+    _inherit_meta(partial_lse, site.log_softmax, partial_lse_val)
+
+    loss_gm = _trace_cross_entropy_loss(target_logits_val, partial_lse_val, valid_val)
+    loss_sum, lse = _inline_graph(
+        graph,
+        loss_gm,
+        (target_logits, partial_lse, valid),
+        site.log_softmax,
+    )
+    _, lse_val = _fake_outputs(loss_gm)
+    _inherit_meta(loss_sum, site.loss, loss_sum.meta["val"])
+    site.loss.replace_all_uses_with(loss_sum)
+
+    backward_gm = _trace_cross_entropy_backward(
+        logits_val, lse_val, safe_targets_val, valid_val, scale_val
+    )
+    grad = _inline_graph(
+        graph,
+        backward_gm,
+        (logits, lse, safe_targets, valid, site.grad_scale),
+        site.grad_to_bf16,
+    )
+    _inherit_meta(grad, site.grad_to_bf16, grad.meta["val"])
+    site.grad_to_bf16.replace_all_uses_with(grad)
+
+
+def flex_gemm_cross_entropy_pass(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple | None = None,
+) -> torch.fx.GraphModule:
+    """Fuse chunked LM-head CE forward/backward into tuned FlexGEMM sites."""
+    sites = [
+        site
+        for node in gm.graph.find_nodes(
+            op="call_function", target=torch.ops.aten._log_softmax.default
+        )
+        if (site := match_cross_entropy_site(node)) is not None
+    ]
+    if not sites:
+        logger.warning(
+            "flex_gemm_cross_entropy_pass was enabled but found no eligible "
+            "LM-head CE site"
+        )
+        return gm
+
+    install_flex_gemm_codegen_shim()
+    for index, site in enumerate(sites):
+        _fuse_cross_entropy_site(gm, site, f"flex_gemm_cross_entropy_body_{index}")
+    gm.graph.eliminate_dead_code()
+    gm.graph.lint()
+    gm.recompile()
+    logger.info(
+        f"flex_gemm_cross_entropy_pass: fused {len(sites)} chunked LM-head CE "
+        f"forward/backward sites with group={_CROSS_ENTROPY_GROUP} and "
+        f"kernel_options={QUACK_CROSS_ENTROPY_KERNEL_OPTIONS}"
+    )
+    return gm
 
 
 def flex_gemm_residual_pass(
@@ -465,19 +950,22 @@ def flex_gemm_residual_pass(
     example_inputs: tuple | None = None,
 ) -> torch.fx.GraphModule:
     """Fuse Qwen3 attention/FFN output GEMMs with their residual adds."""
+    node_order = {node: index for index, node in enumerate(gm.graph.nodes)}
     sites = [
         site
         for node in gm.graph.find_nodes(
             op="call_function", target=torch.ops.aten.add.Tensor
         )
-        if (site := match_residual_site(node)) is not None
+        if (site := match_residual_site(node, node_order)) is not None
     ]
     if not sites:
         logger.info("flex_gemm_residual_pass: no eligible Qwen3 residual site")
         return gm
 
     install_flex_gemm_codegen_shim()
-    for index, site in enumerate(sites):
+    # Later residuals can capture earlier residual outputs. Rewrite downstream
+    # sites first so replacing an earlier add updates already-inserted captures.
+    for index, site in enumerate(reversed(sites)):
         _fuse_residual_site(gm, site, f"flex_gemm_residual_body_{index}")
     gm.graph.lint()
     gm.recompile()

@@ -141,6 +141,16 @@ class GraphTrainerCompileConfig(CompileConfig):
     This is independent from ``enable_flex_gemm_swiglu`` so each epilogue can
     be measured and selected separately."""
 
+    enable_flex_gemm_cross_entropy: bool = False
+    """Fuse chunked LM-head cross entropy forward and backward with FlexGEMM.
+
+    This CoDA-style rewrite targets the dense Qwen3 joint train graph: a plain
+    BFloat16 CUDA ``lm_head`` GEMM, sum reduction, ignore index -100, and a
+    static vocabulary divisible by 64. It requires the same SM100+/QUACK stack
+    as the other FlexGEMM rewrites. The grouped LSE uses coherently rounded
+    BFloat16 logits and QUACK fast math, so it can differ slightly from the
+    native reduction order and transcendental implementation."""
+
     cpu_offload_prefetch_n_layers: int = 1
     """Prefetch reloads this many layers ahead in the backward graph
     to overlap H2D transfers with compute."""
