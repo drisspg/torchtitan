@@ -25,6 +25,7 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 from torchtitan.experiments.graph_trainer.flex_gemm_passes import (
     flex_gemm_cross_entropy_pass,
+    flex_gemm_packed_w13_wgrad_fp32_pass,
     flex_gemm_residual_pass,
     flex_gemm_swiglu_pass,
     packed_w13_wgrad_layout_pass,
@@ -210,6 +211,13 @@ class TestFlexGemmSwiGluPass(TestCase):
         gm.recompile()
         return gm
 
+    def _rewrite_w13_wgrad_fp32(self, *args):
+        gm = self._rewrite_w13_wgrad_layout(*args)
+        gm = flex_gemm_packed_w13_wgrad_fp32_pass(gm, fake_inputs(gm))
+        gm.graph.eliminate_dead_code()
+        gm.recompile()
+        return gm
+
     def _rewrite_residual(self, module_fqn, *args):
         gm = traced(residual_step, *args)
         output_mm = next(
@@ -285,6 +293,19 @@ class TestFlexGemmSwiGluPass(TestCase):
 
         self.assertEqual(count_target(rewritten, torch.ops.aten.bmm.default), 0)
         self.assertEqual(count_target(rewritten, torch.ops.aten.mm.default), 1)
+        actual = rewritten(*args)
+        expected = packed_w13_wgrad_step(*args)
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertTrue(actual.is_contiguous())
+        self.assertEqual(actual.stride(), (2 * D, D, 1))
+
+    def test_fuses_packed_w13_weight_gradient_fp32_store(self):
+        """The W13 wgrad FlexGEMM directly stores rounded FP32 values."""
+        args = make_w13_wgrad_inputs()
+        rewritten = self._rewrite_w13_wgrad_fp32(*args)
+
+        self.assertEqual(len(flex_gemm_nodes(rewritten)), 1)
+        self.assertEqual(count_target(rewritten, torch.ops.aten.mm.default), 0)
         actual = rewritten(*args)
         expected = packed_w13_wgrad_step(*args)
         self.assertTrue(torch.equal(actual, expected))

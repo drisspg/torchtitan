@@ -141,6 +141,15 @@ class PackedW13WgradLayoutSite:
 
 
 @dataclass(frozen=True, slots=True)
+class PackedW13WgradFp32Site:
+    """One packed W13 weight-gradient GEMM followed by a rounded FP32 cast."""
+
+    cast: torch.fx.Node
+    layout: torch.fx.Node | None
+    mm: torch.fx.Node
+
+
+@dataclass(frozen=True, slots=True)
 class ResidualSite:
     """One Qwen3 output GEMM followed by its residual add."""
 
@@ -744,6 +753,60 @@ def match_packed_w13_wgrad_layout_site(
     )
 
 
+def match_packed_w13_wgrad_fp32_site(
+    cast: torch.fx.Node,
+) -> PackedW13WgradFp32Site | None:
+    """Match a layout-corrected packed W13 GEMM followed by an FP32 cast."""
+    if not _is_exact_dtype_cast(cast, torch.float32):
+        return None
+    source = cast.args[0]
+    if not isinstance(source, torch.fx.Node):
+        return None
+    layout = None
+    mm = source
+    if source.target in _VIEW_TARGETS:
+        if not _has_single_user(source, cast) or not isinstance(
+            source.args[0], torch.fx.Node
+        ):
+            return None
+        layout = source
+        mm = source.args[0]
+    consumer = layout or cast
+    module_fqn = _module_fqn(mm)
+    if (
+        mm.target is not torch.ops.aten.mm.default
+        or not _has_single_user(mm, consumer)
+        or not module_fqn.endswith(".feed_forward")
+    ):
+        return None
+    a_val, b_val, mm_val, cast_val = (_fake_val(node) for node in (*mm.args, mm, cast))
+    if any(value is None for value in (a_val, b_val, mm_val, cast_val)):
+        return None
+    source_val = _fake_val(source)
+    if source_val is None:
+        return None
+    if (
+        a_val.device.type != "cuda"
+        or b_val.device != a_val.device
+        or mm_val.device != a_val.device
+        or source_val.device != a_val.device
+        or cast_val.device != a_val.device
+        or a_val.dtype is not torch.bfloat16
+        or b_val.dtype is not torch.bfloat16
+        or mm_val.dtype is not torch.bfloat16
+        or source_val.dtype is not torch.bfloat16
+        or cast_val.dtype is not torch.float32
+        or a_val.ndim != 2
+        or b_val.ndim != 2
+        or mm_val.ndim != 2
+        or source_val.numel() != mm_val.numel()
+        or cast_val.shape != source_val.shape
+        or not source_val.is_contiguous()
+    ):
+        return None
+    return PackedW13WgradFp32Site(cast=cast, layout=layout, mm=mm)
+
+
 def match_swiglu_site(
     mul: torch.fx.Node, node_order: dict[torch.fx.Node, int]
 ) -> SwiGluSite | None:
@@ -868,6 +931,22 @@ def _round_bfloat16_to_float(value: torch.Tensor) -> torch.Tensor:
         constraints="=f,f",
         dtype=torch.float32,
     )
+
+
+def _build_packed_w13_wgrad_fp32_body_graph(
+    a_val: torch.Tensor,
+    b_val: torch.Tensor,
+) -> torch.fx.GraphModule:
+    """Trace a weight-gradient GEMM with a coherently rounded FP32 store."""
+
+    def body(a, b):
+        accumulator = torch.ops.aten.mm.default(a, b)
+        return (_round_bfloat16_to_float(accumulator.float()),)
+
+    with a_val.fake_mode:
+        body_gm = make_fx(body)(a_val, b_val)
+    mark_flex_gemm_body_gemm_node(body_gm, torch.ops.aten.mm.default)
+    return body_gm
 
 
 def _build_cross_entropy_body_graph(
@@ -1136,6 +1215,48 @@ def _rewrite_packed_w13_wgrad_layout(
     site.cast.replace_all_uses_with(output)
 
 
+def _fuse_packed_w13_wgrad_fp32_site(
+    gm: torch.fx.GraphModule,
+    site: PackedW13WgradFp32Site,
+    body_name: str,
+) -> None:
+    """Fuse one weight-gradient GEMM with its rounded FP32 store."""
+    graph = gm.graph
+    a_node, b_node = site.mm.args
+    a_val, b_val = (_fake_val(node) for node in (a_node, b_node))
+    body_gm = _build_packed_w13_wgrad_fp32_body_graph(a_val, b_val)
+    gm.register_module(body_name, body_gm)
+    output_vals = _fake_outputs(body_gm)
+    main_val = output_vals[0]
+    cast_val = _fake_val(site.cast)
+
+    with graph.inserting_before(site.cast):
+        body_attr = graph.get_attr(body_name)
+        fused = graph.call_function(
+            flex_gemm_hop,
+            (
+                torch.ops.aten.mm.default,
+                body_attr,
+                (a_node, b_node),
+                {},
+                dict(QUACK_KERNEL_OPTIONS),
+            ),
+        )
+        main = graph.call_function(operator.getitem, (fused, 0))
+        output = main
+        if tuple(main_val.shape) != tuple(cast_val.shape):
+            output = graph.call_function(
+                torch.ops.aten.reshape.default,
+                (main, list(cast_val.shape)),
+            )
+
+    _inherit_meta(fused, site.mm, output_vals)
+    _inherit_meta(main, site.mm, main_val)
+    if output is not main:
+        _inherit_meta(output, site.cast, cast_val)
+    site.cast.replace_all_uses_with(output)
+
+
 def _fuse_residual_site(
     gm: torch.fx.GraphModule, site: ResidualSite, body_name: str
 ) -> None:
@@ -1363,6 +1484,42 @@ def packed_w13_wgrad_layout_pass(
     logger.info(
         f"packed_w13_wgrad_layout_pass: rewrote {len(sites)} packed W13 "
         "weight-gradient sites to parameter layout"
+    )
+    return gm
+
+
+def flex_gemm_packed_w13_wgrad_fp32_pass(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple | None = None,
+) -> torch.fx.GraphModule:
+    """Fuse packed W13 weight-gradient GEMMs with rounded FP32 stores."""
+    sites = [
+        site
+        for node in gm.graph.find_nodes(
+            op="call_function", target=torch.ops.aten._to_copy.default
+        )
+        if (site := match_packed_w13_wgrad_fp32_site(node)) is not None
+    ]
+    if not sites:
+        logger.warning(
+            "flex_gemm_packed_w13_wgrad_fp32_pass was enabled but found no eligible "
+            "layout-corrected packed W13 weight-gradient site"
+        )
+        return gm
+
+    install_flex_gemm_codegen_shim()
+    for index, site in enumerate(sites):
+        _fuse_packed_w13_wgrad_fp32_site(
+            gm,
+            site,
+            f"flex_gemm_packed_w13_wgrad_fp32_body_{index}",
+        )
+    gm.graph.eliminate_dead_code()
+    gm.graph.lint()
+    gm.recompile()
+    logger.info(
+        f"flex_gemm_packed_w13_wgrad_fp32_pass: fused {len(sites)} packed W13 "
+        f"weight-gradient FP32 stores with kernel_options={QUACK_KERNEL_OPTIONS}"
     )
     return gm
 

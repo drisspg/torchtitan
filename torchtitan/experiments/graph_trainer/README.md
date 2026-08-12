@@ -62,9 +62,10 @@ MODULE=graph_trainer.qwen3 CONFIG=graph_trainer_qwen3_0_6b_flex_gemm ./run_train
 
 All configurations use TorchTitan's fused gate/up SwiGLU override. The optimized
 configuration orients the packed W13 weight-gradient GEMMs so they directly
-return contiguous parameter-layout gradients. This removes one large gradient
-materialization copy per transformer layer without changing loss or grad norm.
-The FlexGEMM configuration remains available for evaluating the tuned packed
+return contiguous parameter-layout gradients, then uses tuned FlexGEMM to store
+the coherently BF16-rounded results directly as FP32. This removes the gradient
+materialization and cast kernels without changing loss or grad norm. The
+FlexGEMM configuration remains available for evaluating the tuned packed
 forward SwiGLU and chunked LM-head cross-entropy rewrites, but it is not the
 recommended throughput configuration for this exact workload.
 

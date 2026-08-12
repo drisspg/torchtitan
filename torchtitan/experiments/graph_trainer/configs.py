@@ -142,6 +142,13 @@ class GraphTrainerCompileConfig(CompileConfig):
     This algebraic rewrite avoids the per-step materialization copy otherwise
     required for the transposed packed gradient returned by the traced graph."""
 
+    enable_flex_gemm_packed_w13_wgrad_fp32: bool = False
+    """Fuse packed W13 weight-gradient GEMMs with their FP32 output casts.
+
+    Requires ``enable_packed_w13_wgrad_layout`` so the FlexGEMM directly stores
+    a contiguous parameter-layout gradient. The epilogue preserves the native
+    BFloat16 rounding boundary before writing Float32."""
+
     enable_flex_gemm_residual: bool = False
     """Fuse Qwen3 attention and FFN output GEMMs with their residual adds.
 
