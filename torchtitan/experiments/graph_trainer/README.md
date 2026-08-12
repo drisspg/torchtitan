@@ -64,11 +64,13 @@ All configurations use TorchTitan's fused gate/up SwiGLU override. The optimized
 configuration orients packed W13 weight-gradient GEMMs to return contiguous
 parameter-layout gradients, stores coherently BF16-rounded W13 gradients directly
 as FP32, fuses W2 dgrad with packed SwiGLU backward and activation rematerialization,
-and shares the LM-head BF16 weight materialization across loss chunks. These
-rewrites preserved deterministic loss and grad norm bitwise in balanced 100-step
-Qwen3-8B runs on one B200. The FlexGEMM configuration remains available for the
-numerics-changing packed forward SwiGLU and chunked cross-entropy experiments,
-but is not the recommended throughput configuration for this workload.
+and shares the LM-head BF16 weight materialization across loss chunks. In three
+balanced 100-step runs on one B200, the complete optimized stack reduced median
+step time from 218.142 ms to 196.336 ms (1.111x), while preserving loss and grad
+norm bitwise. Peak active memory increased by 0.333 GiB and reserved memory by
+3.418 GiB. The FlexGEMM configuration remains available for the numerics-changing
+packed forward SwiGLU and chunked cross-entropy experiments, but is not the
+recommended throughput configuration for this workload.
 
 ```bash
 # Fused TorchTitan baseline

@@ -757,10 +757,9 @@ def match_packed_swiglu_backward_site(
         return None
     grad, gate, up = backward.args[:3]
     dgrad_mm = _view_only_source(grad)
-    if (
-        dgrad_mm.target is not torch.ops.aten.mm.default
-        or not _module_fqn(dgrad_mm).endswith(".feed_forward.w2")
-    ):
+    if dgrad_mm.target is not torch.ops.aten.mm.default or not _module_fqn(
+        dgrad_mm
+    ).endswith(".feed_forward.w2"):
         return None
 
     gate_lane = _packed_lane_source(gate)
@@ -1392,15 +1391,16 @@ def _fuse_packed_swiglu_backward_site(
             weight_val,
             packed_2d_val,
         )
-        packed_grad_2d_val, remat_2d_val = body_gm(
-            grad_val, weight_val, packed_2d_val
-        )
+        packed_grad_2d_val, remat_2d_val = body_gm(grad_val, weight_val, packed_2d_val)
 
-    if (
-        weight_node.target is torch.ops.aten._to_copy.default
-        and set(weight_node.users) == {site.dgrad_mm}
-    ):
-        site.dgrad_mm.prepend(weight_node)
+    if weight_node.target is torch.ops.aten._to_copy.default and set(
+        weight_node.users
+    ) == {site.dgrad_mm}:
+        node_positions = {node: index for index, node in enumerate(graph.nodes)}
+        first_consumer = min(
+            (site.dgrad_mm, site.remat), key=node_positions.__getitem__
+        )
+        first_consumer.prepend(weight_node)
 
     with graph.inserting_before(site.remat):
         packed_2d = graph.call_function(

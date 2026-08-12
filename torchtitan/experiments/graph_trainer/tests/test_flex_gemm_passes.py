@@ -30,10 +30,10 @@ from torchtitan.experiments.graph_trainer.flex_gemm_passes import (
     flex_gemm_residual_pass,
     flex_gemm_swiglu_pass,
     packed_w13_wgrad_layout_pass,
-    shared_lm_head_weight_cast_pass,
     QUACK_CROSS_ENTROPY_KERNEL_OPTIONS,
     QUACK_KERNEL_OPTIONS,
     QUACK_SWIGLU_KERNEL_OPTIONS,
+    shared_lm_head_weight_cast_pass,
 )
 from torchtitan.experiments.graph_trainer.inductor_passes import (
     full_inductor_compilation_pass,
@@ -231,9 +231,9 @@ class TestFlexGemmSwiGluPass(TestCase):
             )
             if tuple(node.meta["val"].shape) == (B * S, H)
         ][0]
-        w2_dgrad.meta.setdefault("custom", {})["module_fqn"] = (
-            "layers.0.feed_forward.w2"
-        )
+        w2_dgrad.meta.setdefault("custom", {})[
+            "module_fqn"
+        ] = "layers.0.feed_forward.w2"
         gm = flex_gemm_packed_swiglu_backward_pass(gm, fake_inputs(gm))
         gm.graph.eliminate_dead_code()
         gm.recompile()
@@ -292,14 +292,10 @@ class TestFlexGemmSwiGluPass(TestCase):
         ):
             if cast.kwargs.get("dtype") is torch.bfloat16:
                 cast.meta.setdefault("custom", {})["module_fqn"] = "lm_head"
-        self.assertEqual(
-            count_target(gm, torch.ops.aten._to_copy.default), 4
-        )
+        self.assertEqual(count_target(gm, torch.ops.aten._to_copy.default), 4)
 
         gm = shared_lm_head_weight_cast_pass(gm, fake_inputs(gm))
-        self.assertEqual(
-            count_target(gm, torch.ops.aten._to_copy.default), 1
-        )
+        self.assertEqual(count_target(gm, torch.ops.aten._to_copy.default), 1)
         self.assertTrue(
             torch.equal(gm(*args), repeated_lm_head_weight_cast_step(*args))
         )
@@ -371,9 +367,7 @@ class TestFlexGemmSwiGluPass(TestCase):
         self.assertEqual(gemm_kwargs, {})
         self.assertEqual(kernel_options, QUACK_KERNEL_OPTIONS)
         self.assertEqual(
-            count_target(
-                rewritten, torch.ops.torchtitan.silu_and_mul_backward.default
-            ),
+            count_target(rewritten, torch.ops.torchtitan.silu_and_mul_backward.default),
             0,
         )
 
@@ -383,20 +377,27 @@ class TestFlexGemmSwiGluPass(TestCase):
             self.assertTrue(torch.equal(candidate, reference))
 
     def test_reuses_packed_swiglu_backward_weight_cast(self):
-        """The packed rewrite moves a single-use W2 cast instead of cloning it."""
+        """The packed rewrite moves a single-use W2 cast before rematerialization."""
 
         def step(x, w13, master_w2, dout):
-            return packed_swiglu_backward_step(
-                x, w13, master_w2.to(torch.bfloat16), dout
+            gate, up = torch.einsum("bsd,hgd->bshg", x, w13).unbind(-1)
+            gate_2d = gate.reshape(B * S, H)
+            up_2d = up.reshape(B * S, H)
+            dout_2d = dout.reshape(B * S, D)
+            remat = silu_and_mul_op(gate_2d, up_2d)
+            d_fused = torch.mm(dout_2d, master_w2.to(torch.bfloat16))
+            d_gate, d_up = torch.ops.torchtitan.silu_and_mul_backward.default(
+                d_fused, gate_2d, up_2d
             )
+            packed_grad = torch.stack((d_gate, d_up), dim=-1).reshape(1, B * S, 2 * H)
+            w2_grad = torch.mm(dout.reshape(B * S, D).t(), remat)
+            return packed_grad, w2_grad
 
         x, w13, w2, dout = make_packed_inputs()
         args = x, w13, w2.float(), dout
         rewritten = self._rewrite_packed_backward(*args, fn=step)
 
-        self.assertEqual(
-            count_target(rewritten, torch.ops.aten._to_copy.default), 1
-        )
+        self.assertEqual(count_target(rewritten, torch.ops.aten._to_copy.default), 1)
         actual = rewritten(*args)
         expected = step(*args)
         for candidate, reference in zip(actual, expected, strict=True):
