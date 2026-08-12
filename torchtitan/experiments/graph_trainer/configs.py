@@ -149,6 +149,13 @@ class GraphTrainerCompileConfig(CompileConfig):
     a contiguous parameter-layout gradient. The epilogue preserves the native
     BFloat16 rounding boundary before writing Float32."""
 
+    enable_flex_gemm_packed_swiglu_backward: bool = False
+    """Fuse W2 input-gradient GEMMs with packed SwiGLU backward.
+
+    This experimental pass uses FlexGEMM's packed interleaved BF16x2 contract
+    to load the saved W13 projection directly and emit one interleaved gradient.
+    It also returns the recomputed activation consumed by the W2 weight gradient."""
+
     enable_flex_gemm_residual: bool = False
     """Fuse Qwen3 attention and FFN output GEMMs with their residual adds.
 
@@ -164,6 +171,13 @@ class GraphTrainerCompileConfig(CompileConfig):
     as the other FlexGEMM rewrites. The grouped LSE uses coherently rounded
     BFloat16 logits and QUACK fast math, so it can differ slightly from the
     native reduction order and transcendental implementation."""
+
+    enable_shared_lm_head_weight_cast: bool = False
+    """Share the BFloat16 LM-head weight materialization across loss chunks.
+
+    This establishes the native arithmetic baseline for evaluating a future
+    FlexGEMM FP32-master-weight input-conversion contract. It is limited to a
+    source with at least four repeated two-dimensional BFloat16 casts."""
 
     cpu_offload_prefetch_n_layers: int = 1
     """Prefetch reloads this many layers ahead in the backward graph

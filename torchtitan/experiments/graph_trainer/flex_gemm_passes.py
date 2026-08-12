@@ -150,6 +150,19 @@ class PackedW13WgradFp32Site:
 
 
 @dataclass(frozen=True, slots=True)
+class PackedSwiGluBackwardSite:
+    """One W2 dgrad, packed SwiGLU backward, and activation-remat chain."""
+
+    backward: torch.fx.Node
+    dgrad_mm: torch.fx.Node
+    gate: torch.fx.Node
+    up: torch.fx.Node
+    packed_bmm: torch.fx.Node
+    packed_grad: torch.fx.Node
+    remat: torch.fx.Node
+
+
+@dataclass(frozen=True, slots=True)
 class ResidualSite:
     """One Qwen3 output GEMM followed by its residual add."""
 
@@ -674,6 +687,155 @@ def match_packed_swiglu_site(swiglu: torch.fx.Node) -> PackedSwiGluSite | None:
     return PackedSwiGluSite(swiglu=swiglu, packed_bmm=packed_bmm)
 
 
+def _view_only_source(node: torch.fx.Node) -> torch.fx.Node:
+    """Follow reshape-only producers to the first computation node."""
+    while node.target in _VIEW_TARGETS and isinstance(node.args[0], torch.fx.Node):
+        node = node.args[0]
+    return node
+
+
+def _packed_backward_grad_output(
+    backward: torch.fx.Node,
+) -> torch.fx.Node | None:
+    """Find the final packed gradient assembled from both backward outputs."""
+    grad_gate = _getitem_user(backward, 0)
+    grad_up = _getitem_user(backward, 1)
+    if grad_gate is None or grad_up is None:
+        return None
+
+    def stack_input(
+        node: torch.fx.Node,
+    ) -> tuple[torch.fx.Node, torch.fx.Node] | None:
+        while len(node.users) == 1:
+            user = next(iter(node.users))
+            if user.target is torch.ops.aten.stack.default:
+                return user, node
+            if user.target not in (*_VIEW_TARGETS, torch.ops.aten.permute.default):
+                return None
+            node = user
+        return None
+
+    gate_stack = stack_input(grad_gate)
+    up_stack = stack_input(grad_up)
+    if gate_stack is None or up_stack is None or gate_stack[0] is not up_stack[0]:
+        return None
+    stack = gate_stack[0]
+    stack_args = stack.args[0]
+    if not isinstance(stack_args, (list, tuple)) or tuple(stack_args) != (
+        gate_stack[1],
+        up_stack[1],
+    ):
+        return None
+
+    node = stack
+    while len(node.users) == 1:
+        user = next(iter(node.users))
+        if user.target not in (*_VIEW_TARGETS, torch.ops.aten.permute.default):
+            break
+        node = user
+    val = _fake_val(node)
+    backward_val = _fake_val(grad_gate)
+    if val is None or backward_val is None:
+        return None
+    m, h = backward_val.shape
+    return node if val.numel() == 2 * m * h and val.is_contiguous() else None
+
+
+def match_packed_swiglu_backward_site(
+    backward: torch.fx.Node,
+) -> PackedSwiGluBackwardSite | None:
+    """Match W2 dgrad plus packed SwiGLU backward and activation remat."""
+    schema = getattr(backward.target, "_schema", None)
+    if (
+        schema is None
+        or schema.name != "torchtitan::silu_and_mul_backward"
+        or len(backward.args) < 3
+        or not all(isinstance(arg, torch.fx.Node) for arg in backward.args[:3])
+        or (len(backward.args) > 3 and backward.args[3] is not None)
+        or backward.kwargs.get("offsets") is not None
+    ):
+        return None
+    grad, gate, up = backward.args[:3]
+    dgrad_mm = _view_only_source(grad)
+    if (
+        dgrad_mm.target is not torch.ops.aten.mm.default
+        or not _module_fqn(dgrad_mm).endswith(".feed_forward.w2")
+    ):
+        return None
+
+    gate_lane = _packed_lane_source(gate)
+    up_lane = _packed_lane_source(up)
+    if gate_lane is None or up_lane is None:
+        return None
+    gate_unbind, gate_index = gate_lane
+    up_unbind, up_index = up_lane
+    if gate_unbind is not up_unbind or (gate_index, up_index) != (0, 1):
+        return None
+    packed_bmm = _packed_bmm_source(gate_unbind)
+    packed_grad = _packed_backward_grad_output(backward)
+    if packed_bmm is None or packed_grad is None:
+        return None
+
+    remat_matches = [
+        node
+        for node in gate.users
+        if getattr(getattr(node.target, "_schema", None), "name", None)
+        == "torchtitan::silu_and_mul"
+        and node.args[:2] == (gate, up)
+        and (len(node.args) < 3 or node.args[2] is None)
+        and node.kwargs.get("offsets") is None
+    ]
+    if len(remat_matches) != 1:
+        return None
+    remat = remat_matches[0]
+
+    grad_val, weight_val = (_fake_val(node) for node in dgrad_mm.args)
+    packed_val = _fake_val(packed_bmm)
+    gate_val = _fake_val(gate)
+    packed_grad_val = _fake_val(packed_grad)
+    remat_val = _fake_val(remat)
+    if any(
+        value is None
+        for value in (
+            grad_val,
+            weight_val,
+            packed_val,
+            gate_val,
+            packed_grad_val,
+            remat_val,
+        )
+    ):
+        return None
+    m, h = gate_val.shape
+    if (
+        grad_val.ndim != 2
+        or weight_val.ndim != 2
+        or tuple(dgrad_mm.meta["val"].shape) != (m, h)
+        or tuple(packed_val.shape) != (1, m, 2 * h)
+        or tuple(packed_grad_val.shape) not in ((m, 2 * h), (1, m, 2 * h))
+        or tuple(remat_val.shape) != (m, h)
+        or not packed_val.is_contiguous()
+        or any(
+            value.dtype is not torch.bfloat16
+            for value in (grad_val, weight_val, packed_val, gate_val, remat_val)
+        )
+        or any(
+            value.device.type != "cuda"
+            for value in (grad_val, weight_val, packed_val, gate_val, remat_val)
+        )
+    ):
+        return None
+    return PackedSwiGluBackwardSite(
+        backward=backward,
+        dgrad_mm=dgrad_mm,
+        gate=gate,
+        up=up,
+        packed_bmm=packed_bmm,
+        packed_grad=packed_grad,
+        remat=remat,
+    )
+
+
 def match_packed_w13_wgrad_layout_site(
     cast: torch.fx.Node,
 ) -> PackedW13WgradLayoutSite | None:
@@ -933,6 +1095,52 @@ def _round_bfloat16_to_float(value: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _triton_sigmoid(value: torch.Tensor) -> torch.Tensor:
+    """Match Triton's approximate sigmoid used by fused SwiGLU kernels."""
+    return inline_asm_elementwise(
+        value.float(),
+        asm_str=(
+            "{ .reg .f32 e; "
+            "mul.rn.f32 e, $1, -1.4426950408889634; "
+            "ex2.approx.ftz.f32 e, e; "
+            "add.rn.f32 e, e, 1.0; "
+            "rcp.approx.ftz.f32 $0, e; }"
+        ),
+        constraints="=f,f",
+        dtype=torch.float32,
+    )
+
+
+def _build_packed_swiglu_backward_body_graph(
+    grad_val: torch.Tensor,
+    weight_val: torch.Tensor,
+    packed_val: torch.Tensor,
+) -> torch.fx.GraphModule:
+    """Trace rounded packed SwiGLU backward through the public FlexGEMM body."""
+    m, h = grad_val.shape[0], weight_val.shape[1]
+
+    def body(grad, weight, packed):
+        accumulator = torch.ops.aten.mm.default(grad, weight)
+        dout = _round_bfloat16_to_float(accumulator.float())
+        lanes = packed.view(m, h, 2)
+        gate = lanes.select(-1, 0).float()
+        up = lanes.select(-1, 1).float()
+        sigmoid = _triton_sigmoid(gate)
+        silu = gate * sigmoid
+        silu_grad = sigmoid * (1 + gate * (1 - sigmoid))
+        grad_gate = dout * up * silu_grad
+        grad_up = dout * silu
+        packed_grad = torch.stack(
+            (grad_gate.to(torch.bfloat16), grad_up.to(torch.bfloat16)), dim=-1
+        ).view(m, 2 * h)
+        return packed_grad, (silu * up).to(torch.bfloat16)
+
+    with grad_val.fake_mode:
+        body_gm = make_fx(body)(grad_val, weight_val, packed_val)
+    mark_flex_gemm_body_gemm_node(body_gm, torch.ops.aten.mm.default)
+    return body_gm
+
+
 def _build_packed_w13_wgrad_fp32_body_graph(
     a_val: torch.Tensor,
     b_val: torch.Tensor,
@@ -1165,6 +1373,69 @@ def _fuse_packed_swiglu_site(
     graph.erase_node(site.packed_bmm)
 
 
+def _fuse_packed_swiglu_backward_site(
+    gm: torch.fx.GraphModule,
+    site: PackedSwiGluBackwardSite,
+) -> None:
+    """Replace W2 dgrad and SwiGLU backward with public packed FlexGEMM."""
+    graph = gm.graph
+    grad_node, weight_node = site.dgrad_mm.args
+    grad_val, weight_val = (_fake_val(node) for node in (grad_node, weight_node))
+    packed_bmm_val = _fake_val(site.packed_bmm)
+    packed_grad_val = _fake_val(site.packed_grad)
+    remat_val = _fake_val(site.remat)
+    m, h = remat_val.shape
+    with grad_val.fake_mode:
+        packed_2d_val = packed_bmm_val.reshape(m, 2 * h)
+        body_gm = _build_packed_swiglu_backward_body_graph(
+            grad_val,
+            weight_val,
+            packed_2d_val,
+        )
+        packed_grad_2d_val, remat_2d_val = body_gm(
+            grad_val, weight_val, packed_2d_val
+        )
+
+    if (
+        weight_node.target is torch.ops.aten._to_copy.default
+        and set(weight_node.users) == {site.dgrad_mm}
+    ):
+        site.dgrad_mm.prepend(weight_node)
+
+    with graph.inserting_before(site.remat):
+        packed_2d = graph.call_function(
+            torch.ops.aten.reshape.default,
+            (site.packed_bmm, [m, 2 * h]),
+        )
+        body_name = f"_flex_gemm_packed_swiglu_backward_body_{id(site)}"
+        gm.register_module(body_name, body_gm)
+        body_attr = graph.get_attr(body_name)
+        fused = graph.call_function(
+            flex_gemm_hop,
+            (
+                torch.ops.aten.mm.default,
+                body_attr,
+                (grad_node, weight_node, packed_2d),
+                {},
+                dict(QUACK_KERNEL_OPTIONS),
+            ),
+        )
+        packed_grad_2d = graph.call_function(operator.getitem, (fused, 0))
+        remat_2d = graph.call_function(operator.getitem, (fused, 1))
+        packed_grad = graph.call_function(
+            torch.ops.aten.reshape.default,
+            (packed_grad_2d, list(packed_grad_val.shape)),
+        )
+
+    _inherit_meta(packed_2d, site.packed_bmm, packed_2d_val)
+    _inherit_meta(fused, site.dgrad_mm, (packed_grad_2d_val, remat_2d_val))
+    _inherit_meta(packed_grad_2d, site.packed_grad, packed_grad_2d_val)
+    _inherit_meta(remat_2d, site.remat, remat_2d_val)
+    _inherit_meta(packed_grad, site.packed_grad, packed_grad_val)
+    site.packed_grad.replace_all_uses_with(packed_grad)
+    site.remat.replace_all_uses_with(remat_2d)
+
+
 def _rewrite_packed_w13_wgrad_layout(
     gm: torch.fx.GraphModule,
     site: PackedW13WgradLayoutSite,
@@ -1393,6 +1664,52 @@ def _fuse_cross_entropy_site(
     site.grad_to_bf16.replace_all_uses_with(grad)
 
 
+def shared_lm_head_weight_cast_pass(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple | None = None,
+) -> torch.fx.GraphModule:
+    """Share repeated FP32-to-BF16 LM-head weight materializations."""
+    casts_by_source: dict[torch.fx.Node, list[torch.fx.Node]] = {}
+    for cast in gm.graph.find_nodes(
+        op="call_function", target=torch.ops.aten._to_copy.default
+    ):
+        if not _is_exact_dtype_cast(cast, torch.bfloat16):
+            continue
+        source = cast.args[0]
+        source_val = _fake_val(source)
+        if (
+            source_val is None
+            or source_val.dtype is not torch.float32
+            or source_val.ndim != 2
+            or _module_fqn(cast) != "lm_head"
+        ):
+            continue
+        casts_by_source.setdefault(source, []).append(cast)
+
+    groups = [casts for casts in casts_by_source.values() if len(casts) >= 4]
+    if not groups:
+        logger.warning(
+            "shared_lm_head_weight_cast_pass was enabled but found no repeated "
+            "LM-head weight materialization"
+        )
+        return gm
+
+    num_removed = 0
+    for casts in groups:
+        shared = casts[0]
+        for duplicate in casts[1:]:
+            duplicate.replace_all_uses_with(shared)
+            num_removed += 1
+    gm.graph.eliminate_dead_code()
+    gm.graph.lint()
+    gm.recompile()
+    logger.info(
+        f"shared_lm_head_weight_cast_pass: shared {len(groups)} LM-head weight "
+        f"materialization groups and removed {num_removed} duplicate casts"
+    )
+    return gm
+
+
 def flex_gemm_cross_entropy_pass(
     gm: torch.fx.GraphModule,
     example_inputs: tuple | None = None,
@@ -1520,6 +1837,35 @@ def flex_gemm_packed_w13_wgrad_fp32_pass(
     logger.info(
         f"flex_gemm_packed_w13_wgrad_fp32_pass: fused {len(sites)} packed W13 "
         f"weight-gradient FP32 stores with kernel_options={QUACK_KERNEL_OPTIONS}"
+    )
+    return gm
+
+
+def flex_gemm_packed_swiglu_backward_pass(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple | None = None,
+) -> torch.fx.GraphModule:
+    """Fuse W2 dgrad, packed SwiGLU backward, and activation rematerialization."""
+    sites = [
+        site
+        for node in gm.graph.nodes
+        if (site := match_packed_swiglu_backward_site(node)) is not None
+    ]
+    if not sites:
+        logger.warning(
+            "flex_gemm_packed_swiglu_backward_pass was enabled but found no eligible "
+            "packed SwiGLU backward site"
+        )
+        return gm
+
+    for site in sites:
+        _fuse_packed_swiglu_backward_site(gm, site)
+    gm.graph.eliminate_dead_code()
+    gm.graph.lint()
+    gm.recompile()
+    logger.info(
+        f"flex_gemm_packed_swiglu_backward_pass: fused {len(sites)} W2 dgrad and "
+        "packed SwiGLU backward sites with tuned FlexGEMM"
     )
     return gm
 

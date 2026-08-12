@@ -25,10 +25,12 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 from torchtitan.experiments.graph_trainer.flex_gemm_passes import (
     flex_gemm_cross_entropy_pass,
+    flex_gemm_packed_swiglu_backward_pass,
     flex_gemm_packed_w13_wgrad_fp32_pass,
     flex_gemm_residual_pass,
     flex_gemm_swiglu_pass,
     packed_w13_wgrad_layout_pass,
+    shared_lm_head_weight_cast_pass,
     QUACK_CROSS_ENTROPY_KERNEL_OPTIONS,
     QUACK_KERNEL_OPTIONS,
     QUACK_SWIGLU_KERNEL_OPTIONS,
@@ -79,6 +81,21 @@ def packed_swiglu_train_step(x, w13, w2, dout):
     return out, d_gate, d_up
 
 
+def packed_swiglu_backward_step(x, w13, w2, dout):
+    """Model the packed backward/remat chains present in the flat train graph."""
+    gate, up = torch.einsum("bsd,hgd->bshg", x, w13).unbind(-1)
+    gate_2d = gate.reshape(B * S, H)
+    up_2d = up.reshape(B * S, H)
+    d_fused = torch.mm(dout.reshape(B * S, D), w2)
+    d_gate, d_up = torch.ops.torchtitan.silu_and_mul_backward.default(
+        d_fused, gate_2d, up_2d
+    )
+    packed_grad = torch.stack((d_gate, d_up), dim=-1).reshape(1, B * S, 2 * H)
+    remat = silu_and_mul_op(gate_2d, up_2d)
+    w2_grad = torch.mm(dout.reshape(B * S, D).t(), remat)
+    return packed_grad, w2_grad
+
+
 def packed_w13_wgrad_step(x, packed_grad):
     """Return the packed W13 gradient through the traced einsum layout."""
     x_batched = x.reshape(1, B * S, D)
@@ -90,6 +107,15 @@ def packed_w13_wgrad_step(x, packed_grad):
 def residual_step(x, weight, residual):
     out = torch.mm(x.reshape(B * S, D), weight.t()).reshape(B, S, D)
     return out + residual
+
+
+def repeated_lm_head_weight_cast_step(x, master_weight):
+    """Model repeated autocast materialization across LM-head chunks."""
+    outputs = []
+    for chunk in x.chunk(4):
+        weight = master_weight.to(torch.bfloat16)
+        outputs.append(torch.mm(chunk, weight.t()))
+    return torch.cat(outputs)
 
 
 def cross_entropy_joint_step(x, weight, targets, grad_scale):
@@ -196,6 +222,23 @@ class TestFlexGemmSwiGluPass(TestCase):
         gm.recompile()
         return gm
 
+    def _rewrite_packed_backward(self, *args, fn=packed_swiglu_backward_step):
+        gm = traced(fn, *args)
+        w2_dgrad = [
+            node
+            for node in gm.graph.find_nodes(
+                op="call_function", target=torch.ops.aten.mm.default
+            )
+            if tuple(node.meta["val"].shape) == (B * S, H)
+        ][0]
+        w2_dgrad.meta.setdefault("custom", {})["module_fqn"] = (
+            "layers.0.feed_forward.w2"
+        )
+        gm = flex_gemm_packed_swiglu_backward_pass(gm, fake_inputs(gm))
+        gm.graph.eliminate_dead_code()
+        gm.recompile()
+        return gm
+
     def _rewrite_w13_wgrad_layout(self, *args):
         gm = traced(packed_w13_wgrad_step, *args)
         bmm = next(
@@ -232,6 +275,34 @@ class TestFlexGemmSwiGluPass(TestCase):
         gm.graph.eliminate_dead_code()
         gm.recompile()
         return gm
+
+    def test_shares_lm_head_weight_cast(self):
+        """Repeated LM-head casts of one FP32 source become one materialization."""
+        generator = torch.Generator(device="cuda").manual_seed(42)
+        x = torch.randn(
+            32, 64, generator=generator, device="cuda", dtype=torch.bfloat16
+        )
+        master_weight = torch.randn(
+            256, 64, generator=generator, device="cuda", dtype=torch.float32
+        )
+        args = (x, master_weight)
+        gm = traced(repeated_lm_head_weight_cast_step, *args)
+        for cast in gm.graph.find_nodes(
+            op="call_function", target=torch.ops.aten._to_copy.default
+        ):
+            if cast.kwargs.get("dtype") is torch.bfloat16:
+                cast.meta.setdefault("custom", {})["module_fqn"] = "lm_head"
+        self.assertEqual(
+            count_target(gm, torch.ops.aten._to_copy.default), 4
+        )
+
+        gm = shared_lm_head_weight_cast_pass(gm, fake_inputs(gm))
+        self.assertEqual(
+            count_target(gm, torch.ops.aten._to_copy.default), 1
+        )
+        self.assertTrue(
+            torch.equal(gm(*args), repeated_lm_head_weight_cast_step(*args))
+        )
 
     def test_fuses_dense_swiglu_site(self):
         """The gate GEMM, silu, and mul collapse into one flex_gemm call."""
@@ -284,6 +355,51 @@ class TestFlexGemmSwiGluPass(TestCase):
         actual = rewritten(*args)
         expected = packed_swiglu_train_step(*args)
         for candidate, reference in zip(actual, expected):
+            self.assertTrue(torch.equal(candidate, reference))
+
+    def test_fuses_packed_swiglu_backward(self):
+        """W2 dgrad, custom backward, and activation remat become FlexGEMM."""
+        args = make_packed_inputs()
+        rewritten = self._rewrite_packed_backward(*args)
+
+        fused = flex_gemm_nodes(rewritten)
+        self.assertEqual(len(fused), 1)
+        gemm_op, body_attr, gemm_args, gemm_kwargs, kernel_options = fused[0].args
+        self.assertIs(gemm_op, torch.ops.aten.mm.default)
+        self.assertEqual(body_attr.op, "get_attr")
+        self.assertEqual(len(gemm_args), 3)
+        self.assertEqual(gemm_kwargs, {})
+        self.assertEqual(kernel_options, QUACK_KERNEL_OPTIONS)
+        self.assertEqual(
+            count_target(
+                rewritten, torch.ops.torchtitan.silu_and_mul_backward.default
+            ),
+            0,
+        )
+
+        actual = rewritten(*args)
+        expected = packed_swiglu_backward_step(*args)
+        for candidate, reference in zip(actual, expected, strict=True):
+            self.assertTrue(torch.equal(candidate, reference))
+
+    def test_reuses_packed_swiglu_backward_weight_cast(self):
+        """The packed rewrite moves a single-use W2 cast instead of cloning it."""
+
+        def step(x, w13, master_w2, dout):
+            return packed_swiglu_backward_step(
+                x, w13, master_w2.to(torch.bfloat16), dout
+            )
+
+        x, w13, w2, dout = make_packed_inputs()
+        args = x, w13, w2.float(), dout
+        rewritten = self._rewrite_packed_backward(*args, fn=step)
+
+        self.assertEqual(
+            count_target(rewritten, torch.ops.aten._to_copy.default), 1
+        )
+        actual = rewritten(*args)
+        expected = step(*args)
+        for candidate, reference in zip(actual, expected, strict=True):
             self.assertTrue(torch.equal(candidate, reference))
 
     def test_reorients_packed_w13_weight_gradient(self):

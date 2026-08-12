@@ -377,6 +377,18 @@ def compile_time_passes(
 
         passes.append(flex_gemm_swiglu_pass)
 
+    if config.compile.enable_flex_gemm_packed_swiglu_backward:
+        if config.compile.inductor_compilation != "full":
+            raise ValueError(
+                "--compile.enable_flex_gemm_packed_swiglu_backward requires "
+                "--compile.inductor_compilation full"
+            )
+        from torchtitan.experiments.graph_trainer.flex_gemm_passes import (
+            flex_gemm_packed_swiglu_backward_pass,
+        )
+
+        passes.append(flex_gemm_packed_swiglu_backward_pass)
+
     if config.compile.enable_flex_gemm_residual:
         if config.compile.inductor_compilation != "full":
             raise ValueError(
@@ -402,6 +414,13 @@ def compile_time_passes(
         )
 
         passes.append(flex_gemm_cross_entropy_pass)
+
+    if config.compile.enable_shared_lm_head_weight_cast:
+        from torchtitan.experiments.graph_trainer.flex_gemm_passes import (
+            shared_lm_head_weight_cast_pass,
+        )
+
+        passes.append(shared_lm_head_weight_cast_pass)
 
     if not include_inductor:
         return passes

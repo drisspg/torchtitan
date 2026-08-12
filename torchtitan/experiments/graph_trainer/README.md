@@ -61,13 +61,14 @@ MODULE=graph_trainer.qwen3 CONFIG=graph_trainer_qwen3_0_6b_flex_gemm ./run_train
 #### Comparing optimized Qwen3-8B graph rewrites on one B200
 
 All configurations use TorchTitan's fused gate/up SwiGLU override. The optimized
-configuration orients the packed W13 weight-gradient GEMMs so they directly
-return contiguous parameter-layout gradients, then uses tuned FlexGEMM to store
-the coherently BF16-rounded results directly as FP32. This removes the gradient
-materialization and cast kernels without changing loss or grad norm. The
-FlexGEMM configuration remains available for evaluating the tuned packed
-forward SwiGLU and chunked LM-head cross-entropy rewrites, but it is not the
-recommended throughput configuration for this exact workload.
+configuration orients packed W13 weight-gradient GEMMs to return contiguous
+parameter-layout gradients, stores coherently BF16-rounded W13 gradients directly
+as FP32, fuses W2 dgrad with packed SwiGLU backward and activation rematerialization,
+and shares the LM-head BF16 weight materialization across loss chunks. These
+rewrites preserved deterministic loss and grad norm bitwise in balanced 100-step
+Qwen3-8B runs on one B200. The FlexGEMM configuration remains available for the
+numerics-changing packed forward SwiGLU and chunked cross-entropy experiments,
+but is not the recommended throughput configuration for this workload.
 
 ```bash
 # Fused TorchTitan baseline

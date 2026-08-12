@@ -64,6 +64,8 @@ def graph_trainer_qwen3_8b_optimized() -> GraphTrainer.Config:
     config = graph_trainer_qwen3_8b_fused_swiglu()
     config.compile.enable_packed_w13_wgrad_layout = True
     config.compile.enable_flex_gemm_packed_w13_wgrad_fp32 = True
+    config.compile.enable_flex_gemm_packed_swiglu_backward = True
+    config.compile.enable_shared_lm_head_weight_cast = True
     return config
 
 
