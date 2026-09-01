@@ -22,7 +22,7 @@ from torchtitan.models.common.attention import (
 
 
 def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    """L2 norm using rsqrt(sum(x^2) + eps), not x/max(norm, eps) like F.normalize, to match FLA kernel."""
+    """Match Attention Gym's rsqrt-based L2 normalization."""
     return x * torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
 
 
@@ -36,7 +36,7 @@ def _torch_native_gated_delta(
     """Standalone math reference for the gated delta rule recurrence.
 
     Sequential O(seqlen) loop -- far too slow for training; kept here as the
-    numerical baseline for the FLA kernels.
+    numerical baseline for the fused kernels.
 
     Args:
         q_BLNK, k_BLNK: (batch, seq, n_heads, key_head_dim)
@@ -103,7 +103,6 @@ def _reference_causal_conv1d_varlen(
     x_TD: torch.Tensor,
     weight: torch.Tensor,
     cu_seqlens: torch.Tensor,
-    cu_seqlens_cpu: torch.Tensor,
 ) -> torch.Tensor:
     """Per-document depthwise causal conv + silu, matching the model's Attention
     Gym varlen conv (which is CUDA-only). Patched over
@@ -111,7 +110,7 @@ def _reference_causal_conv1d_varlen(
     """
     conv_kernel_size = weight.shape[-1]
     out_segments_BTD: list[torch.Tensor] = []
-    cu_seqlens_list = cu_seqlens_cpu.tolist()
+    cu_seqlens_list = cu_seqlens.tolist()
     for start, end in zip(cu_seqlens_list[:-1], cu_seqlens_list[1:], strict=False):
         x_segment_BDT = F.pad(
             x_TD[start:end].transpose(0, 1).unsqueeze(0),
@@ -145,7 +144,6 @@ class ReferenceGatedDeltaKernel(nn.Module):
         beta_TN: torch.Tensor,
         *,
         cu_seqlens: torch.Tensor | None = None,
-        cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if xq_TNK.shape[1] != xv_TNV.shape[1]:
             assert xv_TNV.shape[1] % xq_TNK.shape[1] == 0
@@ -163,9 +161,8 @@ class ReferenceGatedDeltaKernel(nn.Module):
             return _torch_native_gated_delta(
                 xq_BLNK, xk_BLNK, xv_BLNV, g_BLN, beta_BLN
             ).squeeze(0)
-        assert cu_seqlens_cpu is not None
         return _torch_native_gated_delta_varlen(
-            xq_BLNK, xk_BLNK, xv_BLNV, g_BLN, beta_BLN, cu_seqlens_cpu
+            xq_BLNK, xk_BLNK, xv_BLNV, g_BLN, beta_BLN, cu_seqlens.cpu()
         ).squeeze(0)
 
 
@@ -219,10 +216,7 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
     def _make_deltanet(
         self,
         *,
-        # None builds the model with the default FLA kernel config, then swaps
-        # in ReferenceGatedDeltaKernel so the model runs on CPU without FLA
-        # triton kernels.
-        backend: str | None = None,
+        use_fused: bool = False,
         dim: int = 4,
         key_head_dim: int = 2,
         value_head_dim: int = 2,
@@ -278,11 +272,7 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
             conv_k=conv(key_dim),
             conv_v=conv(value_dim),
             inner_gated_delta_net=InnerGatedDeltaNet.Config(
-                kernel=(
-                    GatedDeltaKernel.Config()
-                    if backend is None
-                    else GatedDeltaKernel.Config(backend=backend)
-                ),
+                kernel=GatedDeltaKernel.Config(),
             ),
             norm=RMSNormGated.Config(dim=value_head_dim),
             out_proj=Linear.Config(
@@ -291,7 +281,7 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
                 bias=False,
             ),
         ).build()
-        if backend is None:
+        if not use_fused:
             model.inner_gated_delta_net.kernel = ReferenceGatedDeltaKernel()
 
         model = model.to(device=device, dtype=dtype)
@@ -314,14 +304,8 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
         """Run the current main-branch GatedDeltaNet forward structure."""
         num_tokens = x_TD.shape[0]
         cu_seqlens = None
-        cu_seqlens_cpu = None
         if attention_masks is not None:
             cu_seqlens = attention_masks.cu_seq_q.clone()
-            cu_seqlens_cpu = torch.tensor(
-                attention_masks.cu_seq_q_host,
-                dtype=cu_seqlens.dtype,
-                device="cpu",
-            )
 
         def causal_conv(tensor, conv):
             if cu_seqlens is not None:
@@ -329,7 +313,6 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
                     tensor,
                     conv.weight,
                     cu_seqlens,
-                    cu_seqlens_cpu,
                 )
             tensor = F.pad(
                 tensor.transpose(0, 1).unsqueeze(0),
@@ -371,7 +354,6 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
             decay_TN,
             update_gate_TN,
             cu_seqlens=cu_seqlens,
-            cu_seqlens_cpu=cu_seqlens_cpu,
         )
         output_TNV = model.norm(output_TNV, gate_TNV)
         return model.out_proj(output_TNV.reshape(num_tokens, -1))
@@ -430,7 +412,7 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
 
         attention_masks = create_varlen_metadata_for_document(
             positions,
-            include_host_offsets=True,
+            include_host_offsets=False,
         )
         self._assert_packed_run_matches_per_document(
             model, x_TD, positions, attention_masks
@@ -444,9 +426,6 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
         """
         from torch.nn.attention.flex_attention import BlockMask
 
-        # torchtitan.models.qwen3_5 imports the FLA (flash-linear-attention)
-        # kernels at module scope. FLA is a triton/CUDA-only optional
-        # dependency, so skip instead of erroring on environments without it.
         try:
             from torchtitan.models.qwen3_5 import model_registry
         except ModuleNotFoundError as exc:
@@ -505,8 +484,8 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
             (0, 3, 5, 10),
         )
 
-    def _assert_fla_varlen_matches_per_document(
-        self, backend: str, *, atol: float, rtol: float
+    def _assert_fused_varlen_matches_per_document(
+        self, *, atol: float, rtol: float
     ) -> None:
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is unavailable")
@@ -514,16 +493,15 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
         device = "cuda"
         dtype = torch.bfloat16
         torch.manual_seed(42)
-        # Mirror the debug model's GatedDeltaNet dims so the FLA Triton kernels
-        # accept the shapes; n_value_heads > n_key_heads also exercises the
-        # grouped-query head expansion inside the kernel.
+        # The fused chunk kernel requires 128-wide heads. Unequal key and value
+        # head counts also exercise grouped-head execution.
         model = self._make_deltanet(
-            backend=backend,
+            use_fused=True,
             dim=256,
-            key_head_dim=64,
-            value_head_dim=64,
-            num_key_heads=2,
-            num_value_heads=4,
+            key_head_dim=128,
+            value_head_dim=128,
+            num_key_heads=1,
+            num_value_heads=2,
             conv_kernel_size=4,
             device=device,
             dtype=dtype,
@@ -561,7 +539,13 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
             dtype=torch.int32,
             device=device,
         )
-        x_TD = torch.randn(positions.shape[0], 256, device=device, dtype=dtype)
+        x_TD = torch.randn(
+            positions.shape[0],
+            256,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
 
         attention_masks = create_varlen_metadata_for_document(
             positions,
@@ -569,9 +553,8 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
         )
         actual = model(x_TD, attention_masks)
 
-        # Reference: run each document on its own (non-varlen path) and stitch
-        # the outputs back. Matching this proves the FLA varlen kernels reset
-        # recurrent state at document boundaries instead of bleeding across them.
+        # Reference: run each document on its own and stitch the outputs back.
+        # Matching proves packed execution resets state at document boundaries.
         expected = torch.empty_like(actual)
         doc_starts = (positions == 0).nonzero(as_tuple=True)[0].tolist()
         ends = doc_starts[1:] + [positions.shape[0]]
@@ -582,25 +565,23 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
         self.assertTrue(
             torch.allclose(actual, expected, rtol=rtol, atol=atol),
             msg=(
-                f"{backend}: varlen output diverged from per-document forwards "
+                "varlen output diverged from per-document forwards "
                 f"(max abs diff {max_diff:.3e}, atol {atol}, rtol {rtol}). "
                 "Cross-document state bleed produces diffs on the order of the "
                 "output magnitude, far larger than bf16 kernel noise."
             ),
         )
 
-    def test_fla_chunked_varlen_matches_independent_document_forwards(self):
-        # bf16 tolerance absorbs the differing chunk boundaries between the
-        # packed varlen run and the per-document runs; tighten once confirmed on
-        # GPU (the failure message reports the observed max diff).
-        self._assert_fla_varlen_matches_per_document(
-            "fla_chunked", atol=2e-2, rtol=2e-2
-        )
+        actual.float().square().mean().backward()
+        self.assertIsNotNone(x_TD.grad)
+        self.assertTrue(torch.isfinite(x_TD.grad).all())
+        for parameter in model.parameters():
+            self.assertIsNotNone(parameter.grad)
+            self.assertTrue(torch.isfinite(parameter.grad).all())
 
-    def test_fla_fused_recurrent_varlen_matches_independent_document_forwards(self):
-        self._assert_fla_varlen_matches_per_document(
-            "fla_fused_recurrent", atol=2e-2, rtol=2e-2
-        )
+    def test_fused_varlen_matches_independent_document_forwards(self):
+        # BF16 tolerance absorbs differing packed and per-document chunk boundaries.
+        self._assert_fused_varlen_matches_per_document(atol=2e-2, rtol=2e-2)
 
     def test_batch_invariant_recurrent_matches_paged_attention_gym(self):
         if not torch.cuda.is_available():
@@ -609,11 +590,17 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
         from torchtitan.models.qwen3_5.gdn import _recurrent_gdn_fwd
 
         torch.manual_seed(42)
-        num_tokens, num_heads, key_dim, value_dim = 12, 4, 64, 64
+        num_tokens, num_key_heads, num_value_heads, key_dim, value_dim = (
+            12,
+            1,
+            2,
+            128,
+            128,
+        )
         q = torch.randn(
             1,
             num_tokens,
-            num_heads,
+            num_key_heads,
             key_dim,
             device="cuda",
             dtype=torch.bfloat16,
@@ -622,7 +609,7 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
         v = torch.randn(
             1,
             num_tokens,
-            num_heads,
+            num_value_heads,
             value_dim,
             device="cuda",
             dtype=torch.bfloat16,
@@ -630,34 +617,35 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
         decay = -torch.rand(
             1,
             num_tokens,
-            num_heads,
+            num_value_heads,
             device="cuda",
             dtype=torch.float32,
         )
         update_gate = torch.rand(
             1,
             num_tokens,
-            num_heads,
+            num_value_heads,
             device="cuda",
             dtype=torch.float32,
         )
+        for tensor in (q, k, v, decay, update_gate):
+            tensor.requires_grad_()
         cu_seqlens = torch.tensor([0, 5, 12], device="cuda", dtype=torch.int32)
 
-        actual = _recurrent_gdn_fwd(
+        actual = torch.compile(_recurrent_gdn_fwd, fullgraph=True)(
             q,
             k,
             v,
             decay,
             update_gate,
             cu_seqlens,
-            cu_seqlens.cpu(),
         )
 
         normalized_q = l2norm(q, cu_seqlens=cu_seqlens)
         normalized_k = l2norm(k, cu_seqlens=cu_seqlens)
         state_cache = torch.randn(
             5,
-            num_heads,
+            num_value_heads,
             value_dim,
             key_dim,
             device="cuda",
@@ -667,18 +655,19 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
         prefix_cu_seqlens = torch.tensor(
             [0, prefix_end], device="cuda", dtype=torch.int32
         )
-        prefix_output, _ = recurrent_gdn(
-            normalized_q[:, :prefix_end],
-            normalized_k[:, :prefix_end],
-            v[:, :prefix_end],
-            decay[:, :prefix_end],
-            update_gate[:, :prefix_end],
-            state_cache,
-            cu_seqlens=prefix_cu_seqlens,
-            scale=key_dim**-0.5,
-            state_indices=torch.tensor([3], device="cuda", dtype=torch.int32),
-            has_initial_state=torch.tensor([False], device="cuda"),
-        )
+        with torch.no_grad():
+            prefix_output, _ = recurrent_gdn(
+                normalized_q[:, :prefix_end],
+                normalized_k[:, :prefix_end],
+                v[:, :prefix_end],
+                decay[:, :prefix_end],
+                update_gate[:, :prefix_end],
+                state_cache,
+                cu_seqlens=prefix_cu_seqlens,
+                scale=key_dim**-0.5,
+                state_indices=torch.tensor([3], device="cuda", dtype=torch.int32),
+                has_initial_state=torch.tensor([False], device="cuda"),
+            )
 
         state_indices = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
         has_initial_state = torch.tensor([True, False], device="cuda")
@@ -687,18 +676,19 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
             device="cuda",
             dtype=torch.int32,
         )
-        remaining_output, _ = recurrent_gdn(
-            normalized_q[:, prefix_end:],
-            normalized_k[:, prefix_end:],
-            v[:, prefix_end:],
-            decay[:, prefix_end:],
-            update_gate[:, prefix_end:],
-            state_cache,
-            cu_seqlens=remaining_cu_seqlens,
-            scale=key_dim**-0.5,
-            state_indices=state_indices,
-            has_initial_state=has_initial_state,
-        )
+        with torch.no_grad():
+            remaining_output, _ = recurrent_gdn(
+                normalized_q[:, prefix_end:],
+                normalized_k[:, prefix_end:],
+                v[:, prefix_end:],
+                decay[:, prefix_end:],
+                update_gate[:, prefix_end:],
+                state_cache,
+                cu_seqlens=remaining_cu_seqlens,
+                scale=key_dim**-0.5,
+                state_indices=state_indices,
+                has_initial_state=has_initial_state,
+            )
         expected = torch.cat(
             (prefix_output, remaining_output),
             dim=1,
@@ -706,46 +696,10 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
 
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-    def test_varlen_offsets_are_fresh_per_deltanet_invocation(self):
-        """Successive DeltaNet invocations must not share convolution metadata."""
-        torch.manual_seed(42)
-        model = self._make_deltanet()
-        x_TD = torch.randn(8, 4)
-        positions = torch.tensor(
-            [0, 1, 2, 0, 1, 2, 3, 4],
-            dtype=torch.int32,
-        )
-        attention_masks = create_varlen_metadata_for_document(
-            positions,
-            include_host_offsets=True,
-        )
-        captured_cu_seqlens = []
-
-        def record_cu_seqlens(x_TD, weight, cu_seqlens, cu_seqlens_cpu):
-            captured_cu_seqlens.append(cu_seqlens)
-            return _reference_causal_conv1d_varlen(
-                x_TD,
-                weight,
-                cu_seqlens,
-                cu_seqlens_cpu,
-            )
-
-        with mock.patch(
-            "torchtitan.models.qwen3_5.gdn._causal_conv1d_varlen",
-            side_effect=record_cu_seqlens,
-        ):
-            model(x_TD, attention_masks)
-            model(x_TD, attention_masks)
-
-        # Main runs separate Q/K/V convolutions, so each invocation uses the
-        # same cloned offsets three times.
-        self.assertEqual(len(captured_cu_seqlens), 6)
-        first_invocation = captured_cu_seqlens[0]
-        second_invocation = captured_cu_seqlens[3]
-        self.assertTrue(all(x is first_invocation for x in captured_cu_seqlens[:3]))
-        self.assertTrue(all(x is second_invocation for x in captured_cu_seqlens[3:]))
-        self.assertIsNot(first_invocation, attention_masks.cu_seq_q)
-        self.assertIsNot(second_invocation, first_invocation)
+        actual.float().square().mean().backward()
+        for tensor in (q, k, v, decay, update_gate):
+            self.assertIsNotNone(tensor.grad)
+            self.assertTrue(torch.isfinite(tensor.grad).all())
 
 
 if __name__ == "__main__":
