@@ -48,14 +48,29 @@ STRIP = 16
 
 def parse_eval_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--eval-output", type=Path, required=True)
+    parser.add_argument(
+        "--eval-output",
+        type=Path,
+        required=True,
+        help="JSON path; with several --eval-steps the step is appended to the stem",
+    )
     parser.add_argument("--eval-seq-len", type=int, default=256)
     parser.add_argument("--eval-num-sequences", type=int, default=64)
     parser.add_argument(
         "--eval-skip-documents",
         type=int,
-        default=0,
+        # The training-time Validator packs the first documents of the validation
+        # shard (50 steps x 32K tokens per pass, ~7000 docs); start well past them so
+        # the final metric is on text no decision ever touched.
+        default=20000,
         help="Validation documents to skip first (disjoint from the training validator).",
+    )
+    parser.add_argument(
+        "--eval-steps",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Checkpoint steps to evaluate in turn (default: --checkpoint.load_step)",
     )
     return parser.parse_known_args(argv)
 
@@ -159,31 +174,41 @@ def main() -> None:
             "eval_prefix requires checkpoint.enable so weights can be loaded"
         )
 
+    steps = eval_args.eval_steps or [config.checkpoint.load_step]
     trainer = Trainer(config)
     try:
-        if not trainer.checkpointer.load(step=config.checkpoint.load_step):
-            raise RuntimeError(f"no checkpoint found in {config.dump_folder}")
-        logger.info(f"Evaluating checkpoint step {trainer.step}")
-        for model in trainer.model_parts:
-            model.eval()
         sequences = held_out_sequences(
             trainer.tokenizer,
             seq_len=eval_args.eval_seq_len,
             num_sequences=eval_args.eval_num_sequences,
             skip_documents=eval_args.eval_skip_documents,
         )
-        results = evaluate(trainer, sequences)
-        results["checkpoint_step"] = trainer.step
-        results["dump_folder"] = config.dump_folder
-        eval_args.eval_output.parent.mkdir(parents=True, exist_ok=True)
-        eval_args.eval_output.write_text(json.dumps(results, indent=2))
-        logger.info(
-            "all positions: gap %.5f +- %.5f nats; strip offsets 0-7: %.5f; 8-15: %.5f",
-            results["all"]["gap_nats"],
-            results["all"]["gap_stderr_by_sequence"],
-            results["strip_offset_0_7"]["gap_nats"],
-            results["strip_offset_8_15"]["gap_nats"],
-        )
+        for step in steps:
+            if not trainer.checkpointer.load(step=step):
+                raise RuntimeError(
+                    f"no checkpoint for step {step} in {config.dump_folder}"
+                )
+            logger.info(f"Evaluating checkpoint step {trainer.step}")
+            for model in trainer.model_parts:
+                model.eval()
+            results = evaluate(trainer, sequences)
+            results["checkpoint_step"] = trainer.step
+            results["dump_folder"] = config.dump_folder
+            output = eval_args.eval_output
+            if len(steps) > 1:
+                output = output.with_name(
+                    f"{output.stem}_step{trainer.step}{output.suffix}"
+                )
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(results, indent=2))
+            logger.info(
+                "step %d: gap %.5f +- %.5f nats; strip offsets 0-7: %.5f; 8-15: %.5f",
+                trainer.step,
+                results["all"]["gap_nats"],
+                results["all"]["gap_stderr_by_sequence"],
+                results["strip_offset_0_7"]["gap_nats"],
+                results["strip_offset_8_15"]["gap_nats"],
+            )
     finally:
         trainer.close()
         torch.distributed.destroy_process_group()

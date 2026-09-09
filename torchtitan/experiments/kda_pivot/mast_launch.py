@@ -19,7 +19,7 @@ the data order and global batch match; only ``--variant`` differs.
     mast_launch.py --variant causal   --seed 42 --steps 4000
     mast_launch.py --variant midpoint --seed 42 --steps 4000
     mast_launch.py --mode eval --variant midpoint --seed 42 --steps 4000 \\
-        --train-job <midpoint job name> --eval-seq-len 256 --eval-num-sequences 64
+        --train-job <midpoint job name> --load-steps 500 1000 1500 2000 2500 3000 3500 4000
 """
 
 import argparse
@@ -55,7 +55,11 @@ def parse_args() -> argparse.Namespace:
         help="eval: MAST job name (or absolute dump root) whose checkpoint to load",
     )
     parser.add_argument(
-        "--load-step", type=int, default=-1, help="eval: checkpoint step"
+        "--load-steps",
+        type=int,
+        nargs="+",
+        default=[-1],
+        help="eval: checkpoint steps to evaluate in turn (-1 = latest)",
     )
     parser.add_argument("--eval-seq-len", type=int, default=256)
     parser.add_argument("--eval-num-sequences", type=int, default=64)
@@ -139,7 +143,9 @@ def main() -> None:
     sys.argv = [
         "torchtitan.experiments.kda_pivot.eval_prefix",
         "--eval-output",
-        str(dump_folder / f"eval_prefix_step{args.load_step}.json"),
+        str(dump_folder / "eval_prefix.json"),
+        "--eval-steps",
+        *(str(step) for step in args.load_steps),
         "--eval-seq-len",
         str(args.eval_seq_len),
         "--eval-num-sequences",
@@ -149,8 +155,6 @@ def main() -> None:
         str(dump_folder),
         "--checkpoint.folder",
         str(train_dump / "checkpoint"),
-        "--checkpoint.load_step",
-        str(args.load_step),
     ]
     from torchtitan.experiments.kda_pivot.eval_prefix import main as eval_main
 

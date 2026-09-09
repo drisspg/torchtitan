@@ -46,7 +46,7 @@ gpu-run auto -- torchrun --standalone --nproc_per_node=1 \
   --eval-output ../runs/pilot_causal/eval_prefix.json --eval-seq-len 256 --eval-num-sequences 64 \
   --module torchtitan.experiments.kda_pivot --config kda_pivot_pilot \
   --debug.seed 42 --debug.deterministic --training.steps 4000 \
-  --dump_folder ../runs/pilot_causal --checkpoint.load_step 4000
+  --dump_folder ../runs/pilot_causal --eval-steps 500 1000 1500 2000 2500 3000 3500 4000
 ```
 
 Set `ATTN_GYM_KDA_GATE_REFERENCE` to the arm being evaluated: the question is whether
@@ -76,7 +76,7 @@ After `mastjob fetch <job>`:
 ```zsh
 wandb sync ~/.mast_play/results/<job>/<variant>-seed42/tb/*/wandb/offline-run-*   # -> meta.wandb.io/drisspg/kda-pivot
 mastjob launch --tenant pytorch --h gb300_1 --nnodes 1 --name kdapivot-eval-causal "${pins[@]}" -- $script \
-  --mode eval --variant causal --seed 42 --steps 4000 --train-job <causal job> --load-step 4000
+  --mode eval --variant causal --seed 42 --steps 4000 --train-job <causal job> --load-steps 500 1000 1500 2000 2500 3000 3500 4000
 ```
 
 or evaluate the fetched checkpoint locally with `--train-job /abs/path/to/results/<job>`.
@@ -86,7 +86,10 @@ The workspace package freezes the code; rebuild with `--repo ../attention-gym --
 
 ## Reading the result
 
-`eval_prefix.json` reports, per arm, `prefix_nll - parallel_nll` in nats for all positions
+The prefix eval runs only after training, sweeping the saved checkpoints (every 500 steps)
+so the gap is visible as a function of training progress; the in-training `Validator` is
+parallel-mode only. It skips the first 20000 validation documents so it never overlaps the
+Validator's slice. `eval_prefix_step<N>.json` reports, per arm, `prefix_nll - parallel_nll` in nats for all positions
 and for strip offsets 0-7 (rows a midpoint reference can leak into) vs 8-15. The primary
 metric is the difference-in-differences `gap(midpoint) - gap(causal)`; the causal arm bounds
 ordinary shape-dependent kernel rounding (observed ~1e-3 nats/position at init).
