@@ -166,13 +166,15 @@ def evaluate(trainer: Trainer, sequences: list[list[int]]) -> dict:
 def main() -> None:
     init_logger()
     eval_args, titan_args = parse_eval_args(sys.argv[1:])
-    # The lr-scheduler state in the checkpoint is validated against training.steps,
-    # so pass the same torchtitan args the training run used.
     config = cast(Trainer.Config, ConfigManager().parse_args(titan_args))
     if not config.checkpoint.enable:
         raise ValueError(
             "eval_prefix requires checkpoint.enable so weights can be loaded"
         )
+    # Only weights and the step counter matter here. The dataloader state refuses a
+    # data-parallel degree different from training, and the lr scheduler asserts on
+    # training.steps, so neither is loaded.
+    config.checkpoint.exclude_from_loading = ["dataloader", "optimizer", "lr_scheduler"]
 
     steps = eval_args.eval_steps or [config.checkpoint.load_step]
     trainer = Trainer(config)
