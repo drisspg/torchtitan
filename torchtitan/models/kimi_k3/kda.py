@@ -105,6 +105,10 @@ class KDAKernel(Module):
             gate_1THK,
             raw_beta_1TH.float().sigmoid(),
             cu_seqlens=cu_seqlens,
+            # Autotuning picks kernel configs by timing, so two runs can select
+            # different reduction shapes; pin the defaults when the user asked for
+            # bitwise-reproducible training.
+            autotune=not torch.are_deterministic_algorithms_enabled(),
         )
         return output_1THV
 
