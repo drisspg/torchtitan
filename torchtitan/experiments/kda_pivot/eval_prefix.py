@@ -69,21 +69,25 @@ def held_out_sequences(
         for index, line in enumerate(lines):
             if index < skip_documents:
                 continue
-            tokens = tokenizer.encode(json.loads(line)["text"], add_bos=True, add_eos=True)
+            tokens = tokenizer.encode(
+                json.loads(line)["text"], add_bos=True, add_eos=True
+            )
             if len(tokens) >= seq_len + 1:
                 sequences.append(tokens[: seq_len + 1])
             if len(sequences) == num_sequences:
                 return sequences
-    raise ValueError(f"validation shard has fewer than {num_sequences} long-enough documents")
+    raise ValueError(
+        f"validation shard has fewer than {num_sequences} long-enough documents"
+    )
 
 
 def next_token_nll(trainer: Trainer, tokens: torch.Tensor) -> torch.Tensor:
     """Per-position NLL of ``tokens[1:]`` given ``tokens[:-1]`` in one teacher-forced pass."""
-    model = trainer.model_parts[0]
+    model = cast(BaseModel, trainer.model_parts[0])
     device = tokens.device
     inputs = tokens[:-1]
     labels = tokens[1:]
-    inputs, labels, extra_kwargs = cast(BaseModel, model).preprocess_inputs(
+    inputs, labels, extra_kwargs = model.preprocess_inputs(
         {
             "input": inputs,
             "labels": labels,
@@ -97,6 +101,7 @@ def next_token_nll(trainer: Trainer, tokens: torch.Tensor) -> torch.Tensor:
     with trainer.train_context():
         hidden = model(inputs, **extra_kwargs)
         # ChunkedLossWrapper detaches lm_head from the model forward, so apply it here.
+        # pyrefly: ignore [missing-attribute, not-callable]
         logits = model.lm_head(hidden) if model._skip_lm_head else hidden
     return torch.nn.functional.cross_entropy(logits.float(), labels, reduction="none")
 
@@ -148,9 +153,11 @@ def main() -> None:
     eval_args, titan_args = parse_eval_args(sys.argv[1:])
     # The lr-scheduler state in the checkpoint is validated against training.steps,
     # so pass the same torchtitan args the training run used.
-    config = ConfigManager().parse_args(titan_args)
+    config = cast(Trainer.Config, ConfigManager().parse_args(titan_args))
     if not config.checkpoint.enable:
-        raise ValueError("eval_prefix requires checkpoint.enable so weights can be loaded")
+        raise ValueError(
+            "eval_prefix requires checkpoint.enable so weights can be loaded"
+        )
 
     trainer = Trainer(config)
     try:

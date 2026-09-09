@@ -51,10 +51,9 @@ HF_ASSETS_ENV = "KDA_PIVOT_HF_ASSETS"
 # Padded Qwen3 vocabulary (151669 real tokens).
 QWEN3_VOCAB_SIZE = 151936
 
-TRAIN_SHARDS = (
-    "c4-train.00000-of-01024.json.gz",
-    "c4-train.00001-of-01024.json.gz",
-)
+# Six shards is roughly 1B Qwen3 tokens: enough for the 4000-step, 262K-token/step
+# pilot without repeating data.
+TRAIN_SHARDS = tuple(f"c4-train.{i:05d}-of-01024.json.gz" for i in range(6))
 VALIDATION_SHARD = "c4-validation.00000-of-00008.json.gz"
 
 
@@ -68,7 +67,9 @@ def _data_dir() -> Path:
 
 
 def _hf_assets_path() -> str:
-    return os.environ.get(HF_ASSETS_ENV, str(_experiment_root() / "assets" / "hf" / "Qwen3-0.6B"))
+    return os.environ.get(
+        HF_ASSETS_ENV, str(_experiment_root() / "assets" / "hf" / "Qwen3-0.6B")
+    )
 
 
 def _local_c4(shards: tuple[str, ...]) -> SingleDatasetConfig:
