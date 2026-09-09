@@ -58,7 +58,7 @@ Packages built and preflighted on 2026-09-09 (`mastjob local` on 2x GB200, 3 ste
 
 ```zsh
 cd ~/dotfiles/.ai/skills/mast-interactive/mast_play
-pins=(--workspace-fbpkg interactive_mast:f54c4ba61552aafc1588ef0cb952dfa9
+pins=(--workspace-fbpkg interactive_mast:33420b4a1728d914fd24dcd81b0d3ca0
       --conda-fbpkg torchx_base_conda_env:a9453be15a2b2f87811785dd9395a28a)
 script=repos/torchtitan/torchtitan/experiments/kda_pivot/mast_launch.py
 mastjob launch --tenant pytorch --h gb300 --nnodes 2 --name kdapivot-causal "${pins[@]}" -- $script --variant causal --seed 42 --steps 4000
