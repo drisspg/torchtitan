@@ -35,12 +35,12 @@ def main() -> None:
     results = sorted(
         (
             json.loads(path.read_text())
-            for path in args.eval_dir.glob("eval_prefix*.json")
+            for path in args.eval_dir.glob("eval_*.json")
         ),
         key=lambda result: result["checkpoint_step"],
     )
     if not results:
-        raise FileNotFoundError(f"no eval_prefix*.json under {args.eval_dir}")
+        raise FileNotFoundError(f"no eval_*.json under {args.eval_dir}")
 
     run = wandb.init(project=args.project, id=args.run_id, resume="must")
     run.define_metric("eval/checkpoint_step")
