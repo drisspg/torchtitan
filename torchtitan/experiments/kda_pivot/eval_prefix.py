@@ -10,15 +10,15 @@ For each held-out sequence of ``L + 1`` tokens this computes, per predicted posi
 ``p`` (predicting token ``p + 1`` from tokens ``0..p``):
 
 * ``parallel``: one teacher-forced forward over all ``L`` input tokens, read logit ``p``.
-* ``prefix``: a forward over only the first ``p + 1`` input tokens, read the last logit.
+* ``recurrent`` (default): one forward per sequence with the KDA layers switched to
+  Attention Gym's token-recurrent kernel (the decode path; each token sees only its past
+  by construction) while MLA stays causal teacher-forced.
+* ``prefix`` (``--eval-mode prefix``): a forward over only the first ``p + 1`` input
+  tokens, read the last logit. The literal oracle -- nothing after ``p`` exists -- but it
+  costs ``L`` forwards per sequence (about 200x slower).
 
-The prefix pass is the numerical oracle for autoregressive use: nothing after ``p``
-exists, so any kernel dependence on future tokens is impossible. It costs ``L``
-forwards per sequence. ``--eval-mode recurrent`` instead runs one forward per sequence
-with the KDA layers switched to Attention Gym's token-recurrent kernel (the decode path;
-each token sees only its past by construction) while MLA stays causal teacher-forced.
-Its rounding differs from the chunked kernel's, so validate it against ``prefix`` on the
-causal arm before trusting it. A model that learned
+Both modes agreed to within 2e-4 nats overall and per strip bucket on trained step-4000
+checkpoints of both arms (2026-09-09), so ``recurrent`` is the default. A model that learned
 to exploit a future-dependent rounding channel shows ``prefix`` NLL above ``parallel``
 NLL; the causal-reference arm bounds how much of that gap is ordinary shape-dependent
 kernel rounding. Results are bucketed by position within the 16-token KDA strip so the
@@ -74,9 +74,9 @@ def parse_eval_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     )
     parser.add_argument(
         "--eval-mode",
-        choices=("prefix", "recurrent"),
-        default="prefix",
-        help="autoregressive oracle: per-prefix forwards, or one recurrent-KDA forward",
+        choices=("recurrent", "prefix"),
+        default="recurrent",
+        help="autoregressive oracle: one recurrent-KDA forward, or per-prefix forwards",
     )
     parser.add_argument(
         "--eval-steps",

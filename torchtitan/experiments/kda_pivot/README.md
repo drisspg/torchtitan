@@ -38,12 +38,16 @@ gpu-run auto -- torchrun --standalone --nproc_per_node=1 -m torchtitan.train \
   --training.steps 4000 --dump_folder ../runs/pilot_causal
 ```
 
-Evaluate a checkpoint (parallel vs prefix-only NLL, bucketed by strip offset):
+Evaluate checkpoints (parallel vs autoregressive NLL, bucketed by strip offset). The
+default `--eval-mode recurrent` runs KDA through Attention Gym's recurrent kernel (one
+forward per sequence, seconds per checkpoint); `--eval-mode prefix` is the literal
+per-prefix oracle (~200x slower) and agreed with recurrent to within 2e-4 nats on both
+trained arms:
 
 ```zsh
 gpu-run auto -- torchrun --standalone --nproc_per_node=1 \
   -m torchtitan.experiments.kda_pivot.eval_prefix \
-  --eval-output ../runs/pilot_causal/eval_prefix.json --eval-seq-len 256 --eval-num-sequences 64 \
+  --eval-output ../runs/pilot_causal/eval_recurrent.json --eval-seq-len 256 --eval-num-sequences 64 \
   --module torchtitan.experiments.kda_pivot --config kda_pivot_pilot \
   --debug.seed 42 --debug.deterministic --training.steps 4000 \
   --dump_folder ../runs/pilot_causal --eval-steps 500 1000 1500 2000 2500 3000 3500 4000
@@ -86,10 +90,10 @@ The workspace package freezes the code; rebuild with `--repo ../attention-gym --
 
 ## Reading the result
 
-The prefix eval runs only after training, sweeping the saved checkpoints (every 500 steps)
+The autoregressive eval runs only after training, sweeping the saved checkpoints (every 500 steps)
 so the gap is visible as a function of training progress; the in-training `Validator` is
 parallel-mode only. It skips the first 20000 validation documents so it never overlaps the
-Validator's slice. `eval_prefix_step<N>.json` reports, per arm, `prefix_nll - parallel_nll` in nats for all positions
+Validator's slice. `eval_recurrent_step<N>.json` reports, per arm, `prefix_nll - parallel_nll` (autoregressive minus parallel) in nats for all positions
 and for strip offsets 0-7 (rows a midpoint reference can leak into) vs 8-15. The primary
 metric is the difference-in-differences `gap(midpoint) - gap(causal)`; the causal arm bounds
 ordinary shape-dependent kernel rounding (observed ~1e-3 nats/position at init).

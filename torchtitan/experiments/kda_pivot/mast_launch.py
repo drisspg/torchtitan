@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-seq-len", type=int, default=256)
     parser.add_argument("--eval-num-sequences", type=int, default=64)
     parser.add_argument(
-        "--eval-mode", choices=("prefix", "recurrent"), default="prefix"
+        "--eval-mode", choices=("recurrent", "prefix"), default="recurrent"
     )
     parser.add_argument(
         "--local-data",
