@@ -13,7 +13,12 @@ For each held-out sequence of ``L + 1`` tokens this computes, per predicted posi
 * ``prefix``: a forward over only the first ``p + 1`` input tokens, read the last logit.
 
 The prefix pass is the numerical oracle for autoregressive use: nothing after ``p``
-exists, so any kernel dependence on future tokens is impossible. A model that learned
+exists, so any kernel dependence on future tokens is impossible. It costs ``L``
+forwards per sequence. ``--eval-mode recurrent`` instead runs one forward per sequence
+with the KDA layers switched to Attention Gym's token-recurrent kernel (the decode path;
+each token sees only its past by construction) while MLA stays causal teacher-forced.
+Its rounding differs from the chunked kernel's, so validate it against ``prefix`` on the
+causal arm before trusting it. A model that learned
 to exploit a future-dependent rounding channel shows ``prefix`` NLL above ``parallel``
 NLL; the causal-reference arm bounds how much of that gap is ordinary shape-dependent
 kernel rounding. Results are bucketed by position within the 16-token KDA strip so the
@@ -36,9 +41,11 @@ from pathlib import Path
 from typing import cast
 
 import torch
+from attn_gym.linear.kda import recurrent_kda
 
 from torchtitan.config import ConfigManager
 from torchtitan.experiments.kda_pivot.config_registry import _data_dir, VALIDATION_SHARD
+from torchtitan.models.kimi_k3 import kda as kda_module
 from torchtitan.protocols.model import BaseModel
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.trainer import Trainer
@@ -64,6 +71,12 @@ def parse_eval_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         # the final metric is on text no decision ever touched.
         default=20000,
         help="Validation documents to skip first (disjoint from the training validator).",
+    )
+    parser.add_argument(
+        "--eval-mode",
+        choices=("prefix", "recurrent"),
+        default="prefix",
+        help="autoregressive oracle: per-prefix forwards, or one recurrent-KDA forward",
     )
     parser.add_argument(
         "--eval-steps",
@@ -121,8 +134,27 @@ def next_token_nll(trainer: Trainer, tokens: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.cross_entropy(logits.float(), labels, reduction="none")
 
 
+class recurrent_kda_layers:
+    """Route the KDA layer through ``recurrent_kda`` for the duration of the block.
+
+    Eval-only: ``KDAKernel.forward`` looks up ``chunk_kda`` in its module globals, so
+    rebinding that name is enough and nothing in the model or config changes.
+    """
+
+    def __enter__(self) -> None:
+        self.saved = kda_module.chunk_kda
+
+        def recurrent(*args, autotune: bool, **kwargs):
+            return recurrent_kda(*args, autotune=autotune, **kwargs)
+
+        kda_module.chunk_kda = recurrent
+
+    def __exit__(self, *exc: object) -> None:
+        kda_module.chunk_kda = self.saved
+
+
 @torch.no_grad()
-def evaluate(trainer: Trainer, sequences: list[list[int]]) -> dict:
+def evaluate(trainer: Trainer, sequences: list[list[int]], *, mode: str) -> dict:
     device = torch.device(trainer.device)
     seq_len = len(sequences[0]) - 1
     parallel = torch.zeros(len(sequences), seq_len, dtype=torch.float64)
@@ -130,8 +162,12 @@ def evaluate(trainer: Trainer, sequences: list[list[int]]) -> dict:
     for s, sequence in enumerate(sequences):
         tokens = torch.tensor(sequence, device=device)
         parallel[s] = next_token_nll(trainer, tokens).double().cpu()
-        for p in range(seq_len):
-            prefix[s, p] = next_token_nll(trainer, tokens[: p + 2])[-1].item()
+        if mode == "recurrent":
+            with recurrent_kda_layers():
+                prefix[s] = next_token_nll(trainer, tokens).double().cpu()
+        else:
+            for p in range(seq_len):
+                prefix[s, p] = next_token_nll(trainer, tokens[: p + 2])[-1].item()
         if s % 8 == 0:
             logger.info(f"sequence {s}/{len(sequences)}")
 
@@ -193,8 +229,9 @@ def main() -> None:
             logger.info(f"Evaluating checkpoint step {trainer.step}")
             for model in trainer.model_parts:
                 model.eval()
-            results = evaluate(trainer, sequences)
+            results = evaluate(trainer, sequences, mode=eval_args.eval_mode)
             results["checkpoint_step"] = trainer.step
+            results["eval_mode"] = eval_args.eval_mode
             results["dump_folder"] = config.dump_folder
             output = eval_args.eval_output
             if len(steps) > 1:

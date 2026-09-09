@@ -64,6 +64,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-seq-len", type=int, default=256)
     parser.add_argument("--eval-num-sequences", type=int, default=64)
     parser.add_argument(
+        "--eval-mode", choices=("prefix", "recurrent"), default="prefix"
+    )
+    parser.add_argument(
         "--local-data",
         type=Path,
         default=None,
@@ -143,7 +146,9 @@ def main() -> None:
     sys.argv = [
         "torchtitan.experiments.kda_pivot.eval_prefix",
         "--eval-output",
-        str(dump_folder / "eval_prefix.json"),
+        str(dump_folder / f"eval_{args.eval_mode}.json"),
+        "--eval-mode",
+        args.eval_mode,
         "--eval-steps",
         *(str(step) for step in args.load_steps),
         "--eval-seq-len",
