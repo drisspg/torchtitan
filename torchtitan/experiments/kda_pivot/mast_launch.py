@@ -29,7 +29,9 @@ import sys
 import time
 from pathlib import Path
 
-RESULTS_MOUNT = Path("/mnt/pytorch_distributed")
+RESULTS_MOUNT = Path(
+    os.environ.get("KDA_PIVOT_RESULTS_MOUNT", "/mnt/pytorch_distributed")
+)
 STAGED_DATA = RESULTS_MOUNT / "kda_pivot_data"
 LOCAL_DATA = Path("/tmp/kda_pivot_data")
 # Train shards each config reads (mirrors config_registry); the validation shard is shared.
@@ -107,6 +109,37 @@ def stage_data(local_data: Path | None, config: str) -> Path:
     return LOCAL_DATA
 
 
+def restore_checkpoint(dump_folder: Path) -> None:
+    """Copy this job's latest mirrored checkpoint back so torchtitan resumes after a restart.
+
+    ``run_in_out.py`` mirrors each finished ``checkpoint/step-N`` to the results mount
+    with a ``.published`` marker. MAST restarts an evicted job on fresh hosts under the
+    same job name, so the mirror from the previous attempt is at the same results path.
+    """
+    job = os.environ.get("MAST_HPC_JOB_NAME")
+    if job is None:
+        return
+    mirrored = RESULTS_MOUNT / job / dump_folder.name / "checkpoint"
+    if not mirrored.is_dir():
+        return
+    complete = [p for p in mirrored.glob("step-*") if (p / ".published").exists()]
+    if not complete:
+        return
+    latest = max(complete, key=lambda p: int(p.name.split("-")[1]))
+    target = dump_folder / "checkpoint" / latest.name
+    marker = dump_folder / "checkpoint" / "RESTORED"
+    if os.environ.get("LOCAL_RANK", "0") == "0":
+        if not (target / ".metadata").exists():
+            target.mkdir(parents=True, exist_ok=True)
+            for source in latest.iterdir():
+                if source.is_file() and source.name != ".published":
+                    shutil.copyfile(source, target / source.name)
+        marker.write_text(latest.name)
+        print(f"[mast_launch] restored {latest.name} for resume", flush=True)
+    while not marker.exists():
+        time.sleep(5)
+
+
 def main() -> None:
     args, titan_overrides = parse_args()
     out = Path(os.environ["MAST_PLAY_OUT"])
@@ -157,6 +190,7 @@ def main() -> None:
         *titan_overrides,
     ]
     if args.mode == "train":
+        restore_checkpoint(dump_folder)
         sys.argv = ["torchtitan.train", *titan_args, "--dump_folder", str(dump_folder)]
         from torchtitan.train import main as train_main
 
