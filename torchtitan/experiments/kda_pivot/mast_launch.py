@@ -37,7 +37,8 @@ TRAIN_SHARD_COUNT = {"kda_pivot_pilot": 6, "kda_pivot_scaled": 24}
 VALIDATION_SHARD = "c4-validation.00000-of-00008.json.gz"
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args() -> tuple[argparse.Namespace, list[str]]:
+    """Launcher flags plus any unrecognized ``--x.y`` torchtitan overrides, passed through."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--variant", choices=("causal", "midpoint"), required=True)
     parser.add_argument(
@@ -78,7 +79,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Use an existing local data dir (with en/ shards and hf/ tokenizer) instead of the mount",
     )
-    return parser.parse_args()
+    return parser.parse_known_args()
 
 
 def stage_data(local_data: Path | None, config: str) -> Path:
@@ -107,7 +108,7 @@ def stage_data(local_data: Path | None, config: str) -> Path:
 
 
 def main() -> None:
-    args = parse_args()
+    args, titan_overrides = parse_args()
     out = Path(os.environ["MAST_PLAY_OUT"])
     # The arm label names dump folders and W&B runs; a leak control is its own arm.
     arm = f"leak{args.leak_control:g}" if args.leak_control else args.variant
@@ -149,6 +150,11 @@ def main() -> None:
         str(args.steps),
         "--metrics.enable_tensorboard",
         "--metrics.enable_wandb",
+        # Multi-node runs on unreserved hosts see occasional >100 s stalls; the
+        # torchtitan default (100 s after step 1) turned one into a dead job.
+        "--comm.train_timeout_seconds",
+        "600",
+        *titan_overrides,
     ]
     if args.mode == "train":
         sys.argv = ["torchtitan.train", *titan_args, "--dump_folder", str(dump_folder)]
