@@ -74,7 +74,9 @@ mastjob launch --tenant pytorch --h gb300 --nnodes 2 --name kdapivot-causal "${p
 mastjob launch --tenant pytorch --h gb300 --nnodes 2 --name kdapivot-midpoint "${pins[@]}" -- $script --experiment $exp --variant midpoint --seed 42 --steps 4000
 ```
 
-Checkpoints are written directly to  on the node (verified with DCP on Manifuse), so a MAST restart resumes automatically and  continues an earlier run. 2 nodes x 4 GPUs = dp_shard 8 = 262K tokens/step; 4000 steps = 1.05B tokens, roughly
+Checkpoints are written directly to `/mnt/pytorch_distributed/<job>/<arm>-seed<seed>/checkpoint`
+(DCP on Manifuse, verified), so a MAST restart resumes automatically and
+`--resume-from-job <old job>` continues an earlier run. 2 nodes x 4 GPUs = dp_shard 8 = 262K tokens/step; 4000 steps = 1.05B tokens, roughly
 35-45 min per arm at the 64K tok/s/GPU measured on GB200. Both arms must use the same
 `--nnodes`, `--seed` and `--steps`. Data (`kda_pivot_data/`) is staged under
 `manifold://pytorch_distributed/tree/drisspg/mast_play/` and copied to node-local disk
