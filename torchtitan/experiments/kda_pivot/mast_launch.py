@@ -46,6 +46,11 @@ SHARD_NAMES = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--variant", choices=("causal", "midpoint"), required=True)
+    parser.add_argument(
+        "--experiment",
+        required=True,
+        help="W&B group and tag shared by both arms of one comparison, e.g. pilot-520m-1b",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--steps", type=int, default=4000)
     parser.add_argument("--config", default="kda_pivot_pilot")
@@ -65,6 +70,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-num-sequences", type=int, default=64)
     parser.add_argument(
         "--eval-mode", choices=("recurrent", "prefix"), default="recurrent"
+    )
+    parser.add_argument(
+        "--leak-control",
+        type=float,
+        default=0.0,
+        help="positive control: inject this multiple of the next token's value into the"
+        " parallel KDA output (see config_registry.LEAK_CONTROL_ENV); never for real arms",
     )
     parser.add_argument(
         "--local-data",
@@ -99,11 +111,15 @@ def stage_data(local_data: Path | None) -> Path:
 def main() -> None:
     args = parse_args()
     out = Path(os.environ["MAST_PLAY_OUT"])
-    run_name = f"{args.variant}-seed{args.seed}"
+    # The arm label names dump folders and W&B runs; a leak control is its own arm.
+    arm = f"leak{args.leak_control:g}" if args.leak_control else args.variant
+    run_name = f"{arm}-seed{args.seed}"
     dump_folder = out / run_name
 
     data_root = stage_data(args.local_data)
     os.environ["ATTN_GYM_KDA_GATE_REFERENCE"] = args.variant
+    if args.leak_control:
+        os.environ["KDA_PIVOT_LEAK_CONTROL"] = str(args.leak_control)
     os.environ["KDA_PIVOT_DATA_DIR"] = str(data_root / "c4" / "en")
     os.environ["KDA_PIVOT_HF_ASSETS"] = str(data_root / "hf" / "Qwen3-0.6B")
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -113,9 +129,15 @@ def main() -> None:
     # and are synced from the devgpu with `wandb sync` after `mastjob fetch`.
     os.environ["WANDB_MODE"] = "offline"
     os.environ["WANDB_PROJECT"] = "kda-pivot"
-    os.environ["WANDB_RUN_GROUP"] = f"seed{args.seed}-steps{args.steps}"
+    os.environ["WANDB_RUN_GROUP"] = args.experiment
     os.environ["WANDB_RUN_NAME"] = run_name
-    os.environ["WANDB_RUN_TAGS"] = f"{args.variant},{args.config}"
+    os.environ["WANDB_RUN_JOB_TYPE"] = "train"
+    os.environ["WANDB_RUN_TAGS"] = f"{arm},{args.experiment},{args.config}"
+    os.environ["WANDB_RUN_NOTES"] = (
+        f"gate reference={args.variant}; seed={args.seed}; steps={args.steps}; "
+        f"config={args.config}"
+        + (f"; LEAK CONTROL eps={args.leak_control}" if args.leak_control else "")
+    )
 
     titan_args = [
         "--module",

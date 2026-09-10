@@ -16,6 +16,8 @@ import os
 from dataclasses import replace
 from pathlib import Path
 
+import torch
+
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data import (
     ConcatThenSplitPackingConfig,
@@ -34,6 +36,7 @@ from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.kimi_k3 import (
     _feed_forward_config,
     _kimi_k3_config,
+    kda as kda_module,
     KimiK3StateDictAdapter,
     parallelize_kimi_k3,
 )
@@ -50,11 +53,37 @@ DATA_DIR_ENV = "KDA_PIVOT_DATA_DIR"
 HF_ASSETS_ENV = "KDA_PIVOT_HF_ASSETS"
 # Padded Qwen3 vocabulary (151669 real tokens).
 QWEN3_VOCAB_SIZE = 151936
+# Positive control for the evaluator. When set to eps != 0, the *parallel* KDA path
+# returns ``output + eps * v[t + 1]``: a deliberate, strong dependence on the next
+# token that exists only in chunked mode. A model trained this way must show
+# parallel loss well below the causal arm and autoregressive NLL well above
+# parallel NLL; if the evaluator cannot see that, its nulls mean nothing. Never
+# set for a real arm.
+LEAK_CONTROL_ENV = "KDA_PIVOT_LEAK_CONTROL"
 
 # Six shards is roughly 1B Qwen3 tokens: enough for the 4000-step, 262K-token/step
 # pilot without repeating data.
 TRAIN_SHARDS = tuple(f"c4-train.{i:05d}-of-01024.json.gz" for i in range(6))
 VALIDATION_SHARD = "c4-validation.00000-of-00008.json.gz"
+
+
+def install_leak_control() -> None:
+    """Wrap the KDA layer's ``chunk_kda`` with the next-token leak when LEAK_CONTROL_ENV is set."""
+    eps = float(os.environ.get(LEAK_CONTROL_ENV, "0"))
+    if eps == 0.0:
+        return
+    chunked = kda_module.chunk_kda
+
+    def leaky_chunk_kda(q, k, v, *args, **kwargs):
+        output, state = chunked(q, k, v, *args, **kwargs)
+        future_v = torch.zeros_like(v)
+        future_v[:, :-1] = v[:, 1:]
+        return output + eps * future_v.to(output.dtype), state
+
+    kda_module.chunk_kda = leaky_chunk_kda
+
+
+install_leak_control()
 
 
 def _experiment_root() -> Path:

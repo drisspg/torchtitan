@@ -146,13 +146,15 @@ class WandBLogger(BaseLogger):
         # Create logging directory
         os.makedirs(log_dir, exist_ok=True)
 
+        # wandb.init iterates ``tags``, so a raw string becomes one tag per character.
+        tags = os.getenv("WANDB_RUN_TAGS", None)
         self.wandb.init(
             entity=os.getenv("WANDB_TEAM", None),
             project=os.getenv("WANDB_PROJECT", "torchtitan"),
             name=os.getenv("WANDB_RUN_NAME", None),
             id=os.getenv("WANDB_RUN_ID", None),
             notes=os.getenv("WANDB_RUN_NOTES", None),
-            tags=os.getenv("WANDB_RUN_TAGS", None),
+            tags=tags.split(",") if tags else None,
             group=os.getenv("WANDB_RUN_GROUP", None),
             job_type=os.getenv("WANDB_RUN_JOB_TYPE", None),
             resume_from=os.getenv("WANDB_RESUME_FROM", None),

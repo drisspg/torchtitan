@@ -19,10 +19,15 @@ For each held-out sequence of ``L + 1`` tokens this computes, per predicted posi
 
 Both modes agreed to within 2e-4 nats overall and per strip bucket on trained step-4000
 checkpoints of both arms (2026-09-09), so ``recurrent`` is the default. A model that learned
-to exploit a future-dependent rounding channel shows ``prefix`` NLL above ``parallel``
+to exploit a future-dependent rounding channel shows autoregressive NLL above parallel
 NLL; the causal-reference arm bounds how much of that gap is ordinary shape-dependent
-kernel rounding. Results are bucketed by position within the 16-token KDA strip so the
-rows a midpoint reference can leak into (offsets 0-7) are visible separately.
+kernel rounding.
+
+Results are reported for ``all`` positions and for two disjoint halves of every 16-token
+KDA strip (the sub-block the forward kernel rebases gates in): ``leakable_rows`` are strip
+rows 0-7 (sequence positions with ``p % 16 < 8``), the only rows whose rebase can involve
+a future gate under the midpoint reference; ``causal_rows`` are rows 8-15, causal under
+both references. Genuine exploitation should show a gap in ``leakable_rows`` only.
 
 Run exactly like training, adding eval flags before the torchtitan config args::
 
@@ -158,20 +163,22 @@ def evaluate(trainer: Trainer, sequences: list[list[int]], *, mode: str) -> dict
     device = torch.device(trainer.device)
     seq_len = len(sequences[0]) - 1
     parallel = torch.zeros(len(sequences), seq_len, dtype=torch.float64)
-    prefix = torch.zeros_like(parallel)
+    autoregressive = torch.zeros_like(parallel)
     for s, sequence in enumerate(sequences):
         tokens = torch.tensor(sequence, device=device)
         parallel[s] = next_token_nll(trainer, tokens).double().cpu()
         if mode == "recurrent":
             with recurrent_kda_layers():
-                prefix[s] = next_token_nll(trainer, tokens).double().cpu()
+                autoregressive[s] = next_token_nll(trainer, tokens).double().cpu()
         else:
             for p in range(seq_len):
-                prefix[s, p] = next_token_nll(trainer, tokens[: p + 2])[-1].item()
+                autoregressive[s, p] = next_token_nll(trainer, tokens[: p + 2])[
+                    -1
+                ].item()
         if s % 8 == 0:
             logger.info(f"sequence {s}/{len(sequences)}")
 
-    gap = prefix - parallel
+    gap = autoregressive - parallel
     position = torch.arange(seq_len)
     strip_offset = position % STRIP
 
@@ -181,7 +188,7 @@ def evaluate(trainer: Trainer, sequences: list[list[int]], *, mode: str) -> dict
         stderr = per_sequence.std().item() / math.sqrt(len(sequences))
         return {
             "parallel_nll": parallel[:, mask].mean().item(),
-            "prefix_nll": prefix[:, mask].mean().item(),
+            "autoregressive_nll": autoregressive[:, mask].mean().item(),
             "gap_nats": selected.mean().item(),
             "gap_stderr_by_sequence": stderr,
             "max_abs_gap": selected.abs().max().item(),
@@ -192,8 +199,8 @@ def evaluate(trainer: Trainer, sequences: list[list[int]], *, mode: str) -> dict
         "seq_len": seq_len,
         "num_sequences": len(sequences),
         "all": summary(torch.ones_like(position, dtype=torch.bool)),
-        "strip_offset_0_7": summary(strip_offset < STRIP // 2),
-        "strip_offset_8_15": summary(strip_offset >= STRIP // 2),
+        "leakable_rows": summary(strip_offset < STRIP // 2),
+        "causal_rows": summary(strip_offset >= STRIP // 2),
         "by_strip_offset": [summary(strip_offset == o) for o in range(STRIP)],
         "per_position_gap": gap.mean(dim=0).tolist(),
     }
@@ -241,12 +248,12 @@ def main() -> None:
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text(json.dumps(results, indent=2))
             logger.info(
-                "step %d: gap %.5f +- %.5f nats; strip offsets 0-7: %.5f; 8-15: %.5f",
+                "step %d: gap %.5f +- %.5f nats; leakable rows: %.5f; causal rows: %.5f",
                 trainer.step,
                 results["all"]["gap_nats"],
                 results["all"]["gap_stderr_by_sequence"],
-                results["strip_offset_0_7"]["gap_nats"],
-                results["strip_offset_8_15"]["gap_nats"],
+                results["leakable_rows"]["gap_nats"],
+                results["causal_rows"]["gap_nats"],
             )
     finally:
         trainer.close()

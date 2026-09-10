@@ -65,8 +65,9 @@ cd ~/dotfiles/.ai/skills/mast-interactive/mast_play
 pins=(--workspace-fbpkg interactive_mast:33420b4a1728d914fd24dcd81b0d3ca0
       --conda-fbpkg torchx_base_conda_env:a9453be15a2b2f87811785dd9395a28a)
 script=repos/torchtitan/torchtitan/experiments/kda_pivot/mast_launch.py
-mastjob launch --tenant pytorch --h gb300 --nnodes 2 --name kdapivot-causal "${pins[@]}" -- $script --variant causal --seed 42 --steps 4000
-mastjob launch --tenant pytorch --h gb300 --nnodes 2 --name kdapivot-midpoint "${pins[@]}" -- $script --variant midpoint --seed 42 --steps 4000
+exp=pilot-520m-1b   # W&B group + tag shared by both arms; one per model/data scale
+mastjob launch --tenant pytorch --h gb300 --nnodes 2 --name kdapivot-causal "${pins[@]}" -- $script --experiment $exp --variant causal --seed 42 --steps 4000
+mastjob launch --tenant pytorch --h gb300 --nnodes 2 --name kdapivot-midpoint "${pins[@]}" -- $script --experiment $exp --variant midpoint --seed 42 --steps 4000
 ```
 
 2 nodes x 4 GPUs = dp_shard 8 = 262K tokens/step; 4000 steps = 1.05B tokens, roughly
@@ -78,12 +79,31 @@ at startup; W&B runs offline into the dump folder.
 After `mastjob fetch <job>`:
 
 ```zsh
-wandb sync ~/.mast_play/results/<job>/<variant>-seed42/tb/*/wandb/offline-run-*   # -> meta.wandb.io/drisspg/kda-pivot
-mastjob launch --tenant pytorch --h gb300_1 --nnodes 1 --name kdapivot-eval-causal "${pins[@]}" -- $script \
-  --mode eval --variant causal --seed 42 --steps 4000 --train-job <causal job> --load-steps 500 1000 1500 2000 2500 3000 3500 4000
+wandb sync ~/.mast_play/results/<job>/<variant>-seed42/tb/*/wandb/offline-run-*   # training run -> meta.wandb.io/drisspg/kda-pivot
+# recurrent eval is seconds per checkpoint: fetch the checkpoints and run it locally
+MAST_PLAY_OUT=../runs/eval torchrun --standalone --nproc_per_node=1 $script --mode eval --experiment $exp --variant causal --seed 42 --steps 4000 \
+  --train-job ~/.mast_play/results/<causal job> --load-steps 500 1000 1500 2000 2500 3000 3500 4000 --local-data ../data_local
+python -m torchtitan.experiments.kda_pivot.wandb_log_eval --eval-dir ../runs/eval/causal-seed42 --experiment $exp --arm causal --seed 42
 ```
 
-or evaluate the fetched checkpoint locally with `--train-job /abs/path/to/results/<job>`.
+(or run the eval on MAST with `mastjob launch --h gb300_1 --nnodes 1 ... -- $script --mode eval ...`
+and `--train-job <job name>`, which reads the checkpoint from the results mount).
+
+### W&B layout (project `kda-pivot`)
+
+- One **group per experiment** (`--experiment`, e.g. `pilot-520m-1b`); tags `<arm>`, `<experiment>`, `<config>`.
+- Training runs `<arm>-seed<seed>` (`job_type=train`): torchtitan metrics, parallel-mode `validation_metrics/loss`.
+- Eval runs `<arm>-seed<seed>-eval` (`job_type=eval`, logged by `wandb_log_eval.py` with x = checkpoint step):
+  `eval/<bucket>/{autoregressive_nll,parallel_nll,gap_nats,gap_stderr_by_sequence}` for buckets
+  `all`, `leakable_rows`, `causal_rows`, plus `eval/leakable_minus_causal_rows_gap`.
+- Arms are `causal`, `midpoint`, or `leak<eps>` (positive control, `--leak-control <eps>`).
+
+### Positive control
+
+`--leak-control 0.5` adds `0.5 * v[t+1]` to the *parallel* KDA output only (chunked path), a
+deliberate next-token leak. 300 steps of the pilot config (group `control-300steps`): parallel
+train loss 0.025 vs 5.69 clean; eval gap **+9.98 nats** (recurrent) / **+9.72** (per-prefix
+oracle) vs +0.00005 for the clean model. The evaluator sees exploitation when it exists.
 
 The workspace package freezes the code; rebuild with `--repo ../attention-gym --repo
 . --conda-fbpkg torchx_base_conda_env:a9453be...` after any edit (env unchanged).
@@ -93,7 +113,9 @@ The workspace package freezes the code; rebuild with `--repo ../attention-gym --
 The autoregressive eval runs only after training, sweeping the saved checkpoints (every 500 steps)
 so the gap is visible as a function of training progress; the in-training `Validator` is
 parallel-mode only. It skips the first 20000 validation documents so it never overlaps the
-Validator's slice. `eval_recurrent_step<N>.json` reports, per arm, `prefix_nll - parallel_nll` (autoregressive minus parallel) in nats for all positions
-and for strip offsets 0-7 (rows a midpoint reference can leak into) vs 8-15. The primary
+Validator's slice. `eval_recurrent_step<N>.json` reports, per arm, `autoregressive_nll - parallel_nll` in nats for
+`all` positions and for two disjoint halves of every 16-token KDA strip: `leakable_rows` (strip
+rows 0-7, i.e. `p % 16 < 8`, the only rows whose gate rebase can involve a future gate under the
+midpoint reference) and `causal_rows` (rows 8-15, causal under both references). The primary
 metric is the difference-in-differences `gap(midpoint) - gap(causal)`; the causal arm bounds
 ordinary shape-dependent kernel rounding (observed ~1e-3 nats/position at init).
