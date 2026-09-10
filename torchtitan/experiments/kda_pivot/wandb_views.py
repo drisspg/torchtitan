@@ -59,9 +59,13 @@ def build(experiment: str) -> ws.Workspace:
                         ],
                     ),
                     line(
-                        "model quality: parallel NLL(midpoint) - NLL(causal), nats",
+                        "quality: NLL(midpoint) - NLL(causal); leak = parallel below autoregressive",
                         eval_x,
-                        ["paired/parallel_nll_diff", "paired/parallel_nll_diff_se"],
+                        [
+                            "paired/parallel_nll_diff",
+                            "paired/autoregressive_nll_diff",
+                            "paired/parallel_nll_diff_se",
+                        ],
                     ),
                     line(
                         "t statistics (|t| < 2 = not significant)",
