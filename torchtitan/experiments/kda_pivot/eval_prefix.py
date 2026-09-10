@@ -203,6 +203,14 @@ def evaluate(trainer: Trainer, sequences: list[list[int]], *, mode: str) -> dict
         "causal_rows": summary(strip_offset >= STRIP // 2),
         "by_strip_offset": [summary(strip_offset == o) for o in range(STRIP)],
         "per_position_gap": gap.mean(dim=0).tolist(),
+        # Per-sequence means so arms evaluated on the same sequences can be compared
+        # with a paired test (sequence-to-sequence NLL variance is ~100x the arm difference).
+        "per_sequence": {
+            "parallel_nll": parallel.mean(dim=1).tolist(),
+            "autoregressive_nll": autoregressive.mean(dim=1).tolist(),
+            "leakable_rows_gap": gap[:, strip_offset < STRIP // 2].mean(dim=1).tolist(),
+            "causal_rows_gap": gap[:, strip_offset >= STRIP // 2].mean(dim=1).tolist(),
+        },
     }
 
 
