@@ -122,7 +122,14 @@ def restore_checkpoint(dump_folder: Path) -> None:
     mirrored = RESULTS_MOUNT / job / dump_folder.name / "checkpoint"
     if not mirrored.is_dir():
         return
-    complete = [p for p in mirrored.glob("step-*") if (p / ".published").exists()]
+    # Every node mirrors only its own DCP shards and marks `.published.<node>`; a step
+    # is restorable only once all nodes have marked it.
+    num_nodes = int(os.environ.get("GROUP_WORLD_SIZE", "1"))
+    complete = [
+        p
+        for p in mirrored.glob("step-*")
+        if all((p / f".published.{node}").exists() for node in range(num_nodes))
+    ]
     if not complete:
         return
     latest = max(complete, key=lambda p: int(p.name.split("-")[1]))
@@ -132,7 +139,7 @@ def restore_checkpoint(dump_folder: Path) -> None:
         if not (target / ".metadata").exists():
             target.mkdir(parents=True, exist_ok=True)
             for source in latest.iterdir():
-                if source.is_file() and source.name != ".published":
+                if source.is_file() and not source.name.startswith(".published"):
                     shutil.copyfile(source, target / source.name)
         marker.write_text(latest.name)
         print(f"[mast_launch] restored {latest.name} for resume", flush=True)
