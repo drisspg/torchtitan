@@ -42,6 +42,35 @@ def build(experiment: str) -> ws.Workspace:
         ),
         sections=[
             ws.Section(
+                name="Paired midpoint - causal (same held-out sequences; comparison runs, one per n)",
+                is_open=True,
+                panels=[
+                    line(
+                        "leakage DiD: gap(midpoint) - gap(causal), nats",
+                        eval_x,
+                        ["paired/gap_did", "paired/gap_did_se"],
+                    ),
+                    line(
+                        "leakage DiD, leakable rows only",
+                        eval_x,
+                        [
+                            "paired/leakable_rows_gap_did",
+                            "paired/leakable_rows_gap_did_se",
+                        ],
+                    ),
+                    line(
+                        "model quality: parallel NLL(midpoint) - NLL(causal), nats",
+                        eval_x,
+                        ["paired/parallel_nll_diff", "paired/parallel_nll_diff_se"],
+                    ),
+                    line(
+                        "t statistics (|t| < 2 = not significant)",
+                        eval_x,
+                        ["paired/gap_did_t", "paired/parallel_nll_diff_t"],
+                    ),
+                ],
+            ),
+            ws.Section(
                 name="Leak test: autoregressive - parallel NLL (nats, 0 = causal)",
                 is_open=True,
                 panels=[
