@@ -81,6 +81,10 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         default=None,
         help="Use an existing local data dir (with en/ shards and hf/ tokenizer) instead of the mount",
     )
+    parser.add_argument(
+        "--resume-from-job",
+        help="train: continue from this earlier MAST job's checkpoint folder on the results mount",
+    )
     return parser.parse_known_args()
 
 
@@ -197,7 +201,17 @@ def main() -> None:
         *titan_overrides,
     ]
     if args.mode == "train":
-        restore_checkpoint(dump_folder)
+        # Checkpoints go straight to the shared results mount (the PyTorch Distributed
+        # launcher's pattern): a MAST restart of this job, or a new job passed
+        # --resume-from-job, finds the latest step there and torchtitan resumes on its own.
+        # TB and logs stay node-local; run_in_out.py mirrors and publishes them.
+        job = os.environ.get("MAST_HPC_JOB_NAME")
+        if args.local_data is None and job is not None:
+            checkpoint_job = args.resume_from_job or job
+            titan_args += [
+                "--checkpoint.folder",
+                str(RESULTS_MOUNT / checkpoint_job / run_name / "checkpoint"),
+            ]
         sys.argv = ["torchtitan.train", *titan_args, "--dump_folder", str(dump_folder)]
         from torchtitan.train import main as train_main
 
