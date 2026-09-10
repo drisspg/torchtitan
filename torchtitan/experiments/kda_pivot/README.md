@@ -23,6 +23,10 @@ kda-pivot-experiment/
 - `kda_pivot_pilot`: 12-layer text-only Kimi K3 topology (9 KDA + 3 MLA, dense FFN,
   no vision/MoE), dim 1024, 8 heads, KDA head_dim 128, 520M params (208M non-embedding),
   seq 1024, 32K tokens/microbatch/rank, local C4 shards, validation every 250 steps.
+- `kda_pivot_scaled`: same topology at dim 2048, 16 heads, FFN 8192: 1.45B params (830M
+  non-embedding, the MatX study's size), 24 C4 shards (~4B tokens), 7600 steps at 16 ranks x
+  32K tokens, lr 4e-4, checkpoints every 1000 steps (8.2 GB each). Measured 38K tok/s and
+  49.7 GiB per GB200 -> about 2 h per arm on 4 nodes x 4 GB300.
 
 Both configs disable Attention Gym autotuning under `--debug.deterministic`
 (`torchtitan/models/kimi_k3/kda.py`); without that, repeated runs diverged at step 4.

@@ -32,15 +32,9 @@ from pathlib import Path
 RESULTS_MOUNT = Path("/mnt/pytorch_distributed")
 STAGED_DATA = RESULTS_MOUNT / "kda_pivot_data"
 LOCAL_DATA = Path("/tmp/kda_pivot_data")
-SHARD_NAMES = (
-    "c4-train.00000-of-01024.json.gz",
-    "c4-train.00001-of-01024.json.gz",
-    "c4-train.00002-of-01024.json.gz",
-    "c4-train.00003-of-01024.json.gz",
-    "c4-train.00004-of-01024.json.gz",
-    "c4-train.00005-of-01024.json.gz",
-    "c4-validation.00000-of-00008.json.gz",
-)
+# Train shards each config reads (mirrors config_registry); the validation shard is shared.
+TRAIN_SHARD_COUNT = {"kda_pivot_pilot": 6, "kda_pivot_scaled": 24}
+VALIDATION_SHARD = "c4-validation.00000-of-00008.json.gz"
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,13 +81,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def stage_data(local_data: Path | None) -> Path:
-    """Copy shards and tokenizer to local disk once per node; return the data root."""
+def stage_data(local_data: Path | None, config: str) -> Path:
+    """Copy the config's shards and the tokenizer to local disk once per node."""
     if local_data is not None:
         return local_data
+    shards = [
+        f"c4-train.{i:05d}-of-01024.json.gz" for i in range(TRAIN_SHARD_COUNT[config])
+    ]
+    shards.append(VALIDATION_SHARD)
     if os.environ.get("LOCAL_RANK", "0") == "0":
         (LOCAL_DATA / "c4" / "en").mkdir(parents=True, exist_ok=True)
-        for shard in SHARD_NAMES:
+        for shard in shards:
             target = LOCAL_DATA / "c4" / "en" / shard
             if not target.exists():
                 shutil.copyfile(STAGED_DATA / "c4" / "en" / shard, target)
@@ -116,7 +114,7 @@ def main() -> None:
     run_name = f"{arm}-seed{args.seed}"
     dump_folder = out / run_name
 
-    data_root = stage_data(args.local_data)
+    data_root = stage_data(args.local_data, args.config)
     os.environ["ATTN_GYM_KDA_GATE_REFERENCE"] = args.variant
     if args.leak_control:
         os.environ["KDA_PIVOT_LEAK_CONTROL"] = str(args.leak_control)

@@ -61,9 +61,11 @@ QWEN3_VOCAB_SIZE = 151936
 # set for a real arm.
 LEAK_CONTROL_ENV = "KDA_PIVOT_LEAK_CONTROL"
 
-# Six shards is roughly 1B Qwen3 tokens: enough for the 4000-step, 262K-token/step
-# pilot without repeating data.
-TRAIN_SHARDS = tuple(f"c4-train.{i:05d}-of-01024.json.gz" for i in range(6))
+# One C4 shard is roughly 170M Qwen3 tokens. Six shards cover the 1.05B-token pilot
+# and 24 cover the ~4B-token scaled run without repeating data.
+PILOT_SHARDS = tuple(f"c4-train.{i:05d}-of-01024.json.gz" for i in range(6))
+SCALED_SHARDS = tuple(f"c4-train.{i:05d}-of-01024.json.gz" for i in range(24))
+TRAIN_SHARDS = PILOT_SHARDS
 VALIDATION_SHARD = "c4-validation.00000-of-00008.json.gz"
 
 
@@ -195,6 +197,7 @@ def _trainer_config(
     checkpoint_interval: int,
     validation_freq: int,
     validation_steps: int,
+    lr: float = 8e-4,
 ) -> Trainer.Config:
     seq_len = model_spec.max_context_length
     return Trainer.Config(
@@ -209,7 +212,7 @@ def _trainer_config(
         dataloader=GrainDataLoader.Config(
             dataset=ConcatThenSplitPackingConfig(dataset=train_dataset),
         ),
-        optimizer=default_adamw(lr=8e-4),
+        optimizer=default_adamw(lr=lr),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=warmup_steps,
             decay_ratio=0.8,
@@ -279,7 +282,7 @@ def kda_pivot_pilot() -> Trainer.Config:
     return _trainer_config(
         _model_spec(model, max_context_length=1024),
         hf_assets_path=_hf_assets_path(),
-        train_dataset=_local_c4(TRAIN_SHARDS),
+        train_dataset=_local_c4(PILOT_SHARDS),
         validation_dataset=_local_c4((VALIDATION_SHARD,)),
         tokens_per_microbatch=32 * 1024,
         steps=2000,
@@ -287,4 +290,33 @@ def kda_pivot_pilot() -> Trainer.Config:
         checkpoint_interval=500,
         validation_freq=250,
         validation_steps=50,
+    )
+
+
+def kda_pivot_scaled() -> Trainer.Config:
+    """Scaled arm matching the MatX study's size: dim 2048, 12 layers (9 KDA + 3 MLA).
+
+    ~0.9B non-embedding parameters (plus 2 x 311M embeddings), sized for ~4B C4 tokens:
+    with 16 ranks x 32K tokens = 524K tokens/step that is 7600 steps.
+    """
+    model = text_only_kimi_k3(
+        dim=2048,
+        num_layers=12,
+        full_attention_layers={3, 7, 11},
+        num_heads=16,
+        vocab_size=QWEN3_VOCAB_SIZE,
+        dense_hidden_dim=8192,
+    )
+    return _trainer_config(
+        _model_spec(model, max_context_length=1024),
+        hf_assets_path=_hf_assets_path(),
+        train_dataset=_local_c4(SCALED_SHARDS),
+        validation_dataset=_local_c4((VALIDATION_SHARD,)),
+        tokens_per_microbatch=32 * 1024,
+        steps=7600,
+        warmup_steps=300,
+        checkpoint_interval=1000,
+        validation_freq=500,
+        validation_steps=50,
+        lr=4e-4,
     )
