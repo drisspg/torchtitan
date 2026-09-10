@@ -113,44 +113,6 @@ def stage_data(local_data: Path | None, config: str) -> Path:
     return LOCAL_DATA
 
 
-def restore_checkpoint(dump_folder: Path) -> None:
-    """Copy this job's latest mirrored checkpoint back so torchtitan resumes after a restart.
-
-    ``run_in_out.py`` mirrors each finished ``checkpoint/step-N`` to the results mount
-    with a ``.published`` marker. MAST restarts an evicted job on fresh hosts under the
-    same job name, so the mirror from the previous attempt is at the same results path.
-    """
-    job = os.environ.get("MAST_HPC_JOB_NAME")
-    if job is None:
-        return
-    mirrored = RESULTS_MOUNT / job / dump_folder.name / "checkpoint"
-    if not mirrored.is_dir():
-        return
-    # Every node mirrors only its own DCP shards and marks `.published.<node>`; a step
-    # is restorable only once all nodes have marked it.
-    num_nodes = int(os.environ.get("GROUP_WORLD_SIZE", "1"))
-    complete = [
-        p
-        for p in mirrored.glob("step-*")
-        if all((p / f".published.{node}").exists() for node in range(num_nodes))
-    ]
-    if not complete:
-        return
-    latest = max(complete, key=lambda p: int(p.name.split("-")[1]))
-    target = dump_folder / "checkpoint" / latest.name
-    marker = dump_folder / "checkpoint" / "RESTORED"
-    if os.environ.get("LOCAL_RANK", "0") == "0":
-        if not (target / ".metadata").exists():
-            target.mkdir(parents=True, exist_ok=True)
-            for source in latest.iterdir():
-                if source.is_file() and not source.name.startswith(".published"):
-                    shutil.copyfile(source, target / source.name)
-        marker.write_text(latest.name)
-        print(f"[mast_launch] restored {latest.name} for resume", flush=True)
-    while not marker.exists():
-        time.sleep(5)
-
-
 def main() -> None:
     args, titan_overrides = parse_args()
     out = Path(os.environ["MAST_PLAY_OUT"])
